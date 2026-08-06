@@ -1,0 +1,40 @@
+# 基于 GMSave 的标准 VS 忽略清单 + 原 gm82dx9 忽略项（2026-08-05 重构后）
+
+# MSVC 构建输出
+/Debug/
+/Release/
+/obj/
+/.vs/
+*.tlog
+*.recipe
+*.iobj
+*.ipdb
+*.ilk
+*.pdb
+
+# 编译中间物
+*.o
+*.obj
+
+# 二进制/可执行
+*.exe
+*.dll
+*.exp
+# 但 Librarys/ 下随仓库分发的 DX 运行库必须保留（构建/打包必需）
+!Librarys/D3DX9_43.dll
+# Librarys/lib/ 的 d3d9.lib/d3dx9.lib 同样保留（不忽略 *.lib）
+
+# 生成的 shader 二进制（.vs3/.ps3，构建时由 fxc 重新生成）
+*.ps*
+*.vs*
+
+# 生成的扩展包与下载脚本
+*.gex
+gm82gex.py
+
+# 原项目杂项
+.idea
+cmake-build-*
+todo.txt
+desktop.ini
+*.user

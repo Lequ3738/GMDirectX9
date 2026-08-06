@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- GMDirectX9 — gm82dx9 移植到 GM 8.0。项目结构镜像 GMSave（2026-08-05）：
+     dllmain.cpp 根目录；源码 GMDirectX9/；第三方 Librarys/；输出 Debug//Release/；中间件 obj/。
+     OutDir/IntDir/IncludePath/字符集/工具集 与 GMSave.vcxproj 一致。 -->
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|Win32"><Configuration>Debug</Configuration><Platform>Win32</Platform></ProjectConfiguration>
+    <ProjectConfiguration Include="Release|Win32"><Configuration>Release</Configuration><Platform>Win32</Platform></ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>17.0</VCProjectVersion><Keyword>Win32Proj</Keyword>
+    <ProjectGuid>{1A2B3C4D-5E6F-4A8B-9C0D-E1F2A3B4C5D6}</ProjectGuid>
+    <RootNamespace>GMDirectX9</RootNamespace><WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <!-- CharacterSet=MultiByte: gm82dx9 源码是 ANSI 风格(MessageBox 传 char*, 与 GM 扩展接口一致) -->
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType><UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset><CharacterSet>MultiByte</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType><UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset><CharacterSet>MultiByte</CharacterSet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="PropertySheets">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+  <PropertyGroup><IncludePath>.;Librarys;source;$(IncludePath)</IncludePath>
+    <!-- TargetName=GMDirectX9: 生成 GMDirectX9.dll（用户要求；gej/gex 打包文件已删除，纯净 DLL） -->
+    <TargetName>GMDirectX9</TargetName>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
+    <OutDir>$(ProjectDir)Debug\</OutDir>
+    <IntDir>$(ProjectDir)obj\Debug\</IntDir>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
+    <OutDir>$(ProjectDir)Release\</OutDir>
+    <IntDir>$(ProjectDir)obj\Release\</IntDir>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <!-- SDLCheck=false: 插件含大量 __asm(数学 trampoline/CreateDevice), /sdl 无意义且可能干扰 -->
+      <WarningLevel>Level3</WarningLevel><SDLCheck>false</SDLCheck>
+      <!-- 不加 NOMINMAX: 源码用 windows.h 的 min/max 宏(shaders.cpp 等) -->
+      <PreprocessorDefinitions>WIN32;GMDIRECTX9_EXPORTS;_WINDOWS;_USRDLL;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode><LanguageStandard>stdcpp20</LanguageStandard>
+      <AdditionalOptions>/Zc:__cplusplus /utf-8 %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem><EnableUAC>false</EnableUAC>
+      <AdditionalLibraryDirectories>$(ProjectDir)Librarys\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>d3d9.lib;d3dx9.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalOptions>/SAFESEH:NO %(AdditionalOptions)</AdditionalOptions>
+    </Link>
+    <!-- 纯 patch 版(2026-08-06): 无 shader 功能, 移除 fxc 编译 HLSL 的 PreBuildEvent -->
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClInclude Include="framework.h" /><ClInclude Include="pch.h" />
+    <ClInclude Include="source\gm82dx9.h" /><ClInclude Include="source\gm_log.h" />
+    <ClInclude Include="Librarys\dxerr\dxerr.h" />
+    <ClInclude Include="Librarys\DirectXMath\DirectXMath.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="dllmain.cpp" /><ClCompile Include="pch.cpp" />
+    <ClCompile Include="source\gm_log.cpp" />
+    <ClCompile Include="source\patch_support.cpp" />
+    <ClCompile Include="source\inject.cpp" />
+    <ClCompile Include="Librarys\dxerr\dxerr.cpp" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

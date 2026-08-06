@@ -1,0 +1,52 @@
+{
+	"name": "GMDirectX9",
+	"folder": "gmdx9",
+	"version": "1.0",
+	"author": "Lequ",
+	"date": "2026/8/6",
+	"license": "Free to use, also for commercial games.",
+	"description": "GMDirectX9 - DirectX8 to DirectX9 render-backend replacement for GameMaker 8.0.",
+	"helpfile": "",
+	"hidden": false,
+	"dependencies": [],
+	"files": [
+		{
+			"filename": "D3DX9_43.dll",
+			"origname": "Librarys\\D3DX9_43.dll",
+			"kind": 1,
+			"init": "",
+			"final": "",
+			"functions": [
+				{
+					"name": "D3DXCheckVersion",
+					"extname": "",
+					"calltype": 12,
+					"helpline": "",
+					"hidden": true,
+					"argtypes": [],
+					"returntype": 2
+				}
+			],
+			"constants": []
+		},
+		{
+			"filename": "GMDirectX9.dll",
+			"origname": "Release\\GMDirectX9.dll",
+			"kind": 1,
+			"init": "",
+			"final": "",
+			"functions": [
+				{
+					"name": "gm82dx9_loaded",
+					"extname": "",
+					"calltype": 12,
+					"helpline": "gm82dx9_loaded()",
+					"hidden": true,
+					"argtypes": [],
+					"returntype": 2
+				}
+			],
+			"constants": []
+		}
+	]
+}
