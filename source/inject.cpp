@@ -202,6 +202,32 @@ HRESULT WINAPI SetVertexShader(IDirect3DDevice9 *dev, DWORD fvf) {
     return dev->SetFVF(fvf);
 }
 
+// [GM80] SetViewport 接管(2026-08-06, 表面渲染 viewport 钳制): D3D9 的 viewport 超出
+// render target 时【只裁剪不收缩】→ 表面渲染(如 400x225 世界表面)时, runner 按视图端口
+// (窗口尺寸 1920x1080)设 viewport、投影按视图(400x225)铺满整个视口, 但 render target 只有
+// 400x225 → 只捕到左上角一小块, 内容被放大几倍。D3D8 会把 viewport 钳到 render target。
+// 这里把 D3D_SetViewport 的设备调用点(0x4a2432)重定向到本函数, 钳到当前 render target 尺寸。
+HRESULT WINAPI SetViewport_inj(IDirect3DDevice9 *dev, D3DVIEWPORT9 *vp) {
+    IDirect3DSurface9 *rt = nullptr;
+    if (SUCCEEDED(dev->GetRenderTarget(0, &rt))) {
+        D3DSURFACE_DESC desc;
+        if (SUCCEEDED(rt->GetDesc(&desc))) {
+            LONG x = vp->X, y = vp->Y;
+            LONG w = (LONG)vp->Width, h = (LONG)vp->Height;
+            if (x < 0) { w += x; x = 0; }
+            if (y < 0) { h += y; y = 0; }
+            if ((LONG)desc.Width  - x < w) w = (LONG)desc.Width  - x;
+            if ((LONG)desc.Height - y < h) h = (LONG)desc.Height - y;
+            if (w < 0) w = 0;
+            if (h < 0) h = 0;
+            vp->X = x; vp->Y = y;
+            vp->Width = (DWORD)w; vp->Height = (DWORD)h;
+        }
+        rt->Release();
+    }
+    return dev->SetViewport(vp);
+}
+
 short old_cw = 0;
 short new_cw = 0;
 
@@ -948,8 +974,15 @@ bool gm80_apply_patches(void) {
     PATCH_SIMPLE(0x49cb40, 0xac); // Clear (INNER_draw_clear_alpha)
     PATCH_SIMPLE(0x49e76a, 0xac); // Clear (sub_49E748 = clear_depth)
 
-    // SetViewport (0xA0→0xBC, sz6)
-    PATCH_SIMPLE(0x4a2432, 0xbc); // SetViewport (D3D_SetViewport)
+    // SetViewport —— 2026-08-06 从槽位重映射(0xA0→0xBC)改为重定向到 SetViewport_inj:
+    // D3D9 的 viewport 不随 render target 收缩(表面渲染只捕左上角), 需手动钳到 render target 尺寸。
+#define PATCH(a) \
+             offset = 0xe890; \
+             GM_WRITE((a), &offset, 2); \
+             ptr = ((char*)(&SetViewport_inj) - (a + 6)); \
+             GM_WRITE((a + 2), &ptr, 4)
+    PATCH(0x4a2432); // SetViewport (D3D_SetViewport)
+#undef PATCH
 
     // ✅ [GM80-确认] SetMaterial：8.0 扫描未发现 0xA8 站点（8.1 有 0x56475e→0xc4），无需补丁。
 
