@@ -14,8 +14,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
         gm_log("=== GMDirectX9 DllMain entry ===");
         gm80_apply_patches();   // 全部补丁（SDK/D3D9/D3DCAPS/D3DX/vtable 重映射）在 inject.cpp
     } else if (fdwReason == DLL_PROCESS_DETACH) {
-        // [GM80] 卸载安全(2026-08-06): 恢复设备 vtable 槽 0x40(Reset), 避免 runner 在 DLL 卸载后
-        // 跳未映射的 ResetDevice。对齐 gm82dx9 的 last_resort 挂钩(8.0 等价 = INNER_external_free)。
+        // [GM80] 卸载安全: 恢复 vtable 槽 0x40(Reset), 避免卸载后跳未映射内存。
         gm80_restore_reset_hook();
         gm_log("=== GMDirectX9 DllMain detach ===");
     }

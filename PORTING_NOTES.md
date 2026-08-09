@@ -335,3 +335,118 @@ hidden 函数(与 D3DX9_43.dll 的 D3DXCheckVersion 同款 hidden)。它不是 G
    screen_refresh/CreateVertexBuffer/投影矩阵注入)标"✅ GM80-确认"。剩余 GM80-TODO 仅 1 处条件性备注。
 4. **日志移除**: GM80_LOG=0(gm_log.cpp 整体编译掉, 不再写 %TEMP%\gm82dx9_port.log); 删除 CreateDevice 的
    gm_wrapper_hit.txt 调试标记写入。dumpbin 验证仅 1 个导出 gm82dx9_loaded(加载触发)。
+
+## 18. ✅ 2026-08-08 SetVertexShader 恢复"自定义 VS 跨绘制存活"(对照 gm82dx9 原版 using_shader 分支)
+
+**背景**: §11 纯 patch 化时把原 shaders.cpp 的 `using_shader`/顶点声明分支删成 `dev->SetFVF(fvf)`。
+后果: GMGraphic 等外部 DLL 直接在 0x58d388 设备上绑自定义顶点着色器后, runner 每次绘制的
+`SetVertexShader(FVF)`(D3D9 里 FVF 与 VS 互斥)会把自定义 VS 冲掉 → 固定管线兜底 → ps-only 只能
+ps_2_0。经查 gm82dx9 原版已解决该问题(钩子内 FVF→顶点声明翻译), 本移植版需恢复。
+
+**解法(不依赖 DLL 间共享标志)**: 钩子内 `dev->GetVertexShader()`, 非空(=外部 DLL 绑了自定义 VS)时
+把引擎 FVF 重置翻译成 `SetVertexDeclaration`(三种引擎布局), 自定义 VS 保持绑定; 空时照旧 `SetFVF(fvf)`。
+状态直接取自设备, GMGraphic 无需任何改动。
+
+**IDA 验证(2026-08-08, 空工程.exe / y09x)**: 18 个 SetVertexShader 调用点全部 `call [eax+130h]`,
+FVF 与布局仅三种, 与 gm82dx9 的 elems 完全一致:
+
+| 布局 | FVF | stride | 调用点 | 顶点数据 |
+|---|---|---|---|---|
+| shape | `0x42` XYZ\|DIFFUSE | 16 | draw_point/line/triangle/rectangle 等 | FLOAT3+D3DCOLOR |
+| 2d | `0x142` XYZ\|DIFFUSE\|TEX1 | 24 | DrawImage/DrawImage2/DrawTexture/sub_4A459C | FLOAT3+D3DCOLOR+FLOAT2 |
+| 3d | `0x152` XYZ\|NORMAL\|DIFFUSE\|TEX1 | 36 | INNER_d3d_primitive_end | FLOAT3+FLOAT3+D3DCOLOR+FLOAT2 |
+
+声明偏移正确性论证: 引擎现在以这三个 FVF 在固定管线下渲染正常, 顶点数据布局必为 FVF 隐含布局,
+声明镜像即可(shape@0/12, 2d@0/12/16, 3d@0/12/24/28)。
+
+**实现**: `inject.cpp` SetVertexShader 钩子(含 `gm80_elems_shape/2d/3d` + 懒创建 `gm80_decl_*`)。
+GetVertexShader 不 AddRef 返回对象(D3D9 惯例, SDK save/restore 示例同款), 不 Release, 避免每帧
+数千次调用泄漏/双释放。未知 FVF + 自定义 VS 激活时返回 D3DERR_INVALIDCALL(引擎忽略返回值,
+保持上次声明; 引擎实际只用三种 FVF, 不会走到)。
+
+**编译**: `MSBuild GMDirectX9.sln -p:Configuration=Release -p:Platform=x86` ✅ 通过。
+
+**待实测**: GM8.0 工程挂 GMDirectX9.dll + GMGraphic, 绑一个带自定义 VS 的 shader(vs_3_0/ps_3_0),
+确认① shader 激活后 draw_sprite/draw_primitive 等引擎绘制仍正常(走自定义 VS); ② ps_3_0 不再全透明
+(修复前 ps_3_0 因 FVF 管线喂不进 v0/v1 而全透明)。注意: 自定义 VS 需按 gm82dx9 模型写成通用变换
+(mul(pos, WVP) + 透传 color/texcoord, 参考 vs_pass.hlsl), 以适配引擎三种顶点布局。
+
+## 19. ✅ 2026-08-08 仿固定管线 VS —— 无 VS 场景也能用 SM3.0（GMGraphic 配合）
+
+**背景**: §18 的钩子只解决"自定义 VS 跨绘制存活"。但 ps-only 着色器(SDF/用户 shader_create 空 VS)
+在固定管线(FVF)下仍只能 ps_2_0: D3D9 固定管线只把插值喂进 ps_2.x 的 t0/v0, ps_3_0 的输入
+(`dcl_texcoord v0` + `dcl_color v1`) 读 0 → 全透明。只有顶点着色器能把数据喂进 ps_3_0 的 v0/v1。
+
+**方案(用户定调, 2026-08-08)**: 
+- GMDirectX9: `SetVertexShader(FVF)` 钩子无 VS 但自定义 PS 激活时, 绑【仿固定管线 VS】(FFP 等价的
+  pos*W*V*P + 透传 color/uv), SM3.0 无 VS 也能用。无自定义 PS 时保持 SetFVF 真固定管线(引擎 FFP
+  绘制零回归: 点大小/雾/光照照旧)。
+- GMGraphic: ① `shader_create` ps 版本无条件按设备能力选 ps_3_0(删"无 VS 强制 ps_2_0"); ② 自绘
+  (shader_set ps-only 分支 + vertex::end)在 D3D9 绑共享透传 VS + 声明, 不再走 SetFVF; D3D8 保持
+  固定顶点管线(ps_1.4 无 v0/v1 路由问题, 最高 ps_1.4)。
+
+**矩阵约定(关键, 2026-08-08 实测修正)**: 必须写 `mul(uWVP, pos)`(矩阵在前), 与 gm82dx9 一致。
+原因: HLSL float4x4 在常量寄存器里默认【列主序】(register c0 = 矩阵列 0), 而 SetVertexShaderConstantF
+写入的是 D3D 行主序矩阵(行=c0..c3) → shader 读到的矩阵 = 传入矩阵的转置 S^T。
+`mul(uWVP, pos)` = S^T*pos = pos*S(含投影平移, 与 FFP 等价); `mul(pos, uWVP)` = pos*S^T = S*pos,
+**丢掉投影的平移分量(如 [0,view_w]→NDC[-1,1] 的 -1)** → 精灵整体偏移半个屏幕、大量出屏。
+fxc 证据: `mul(uWVP,pos)` 编译成跨寄存器累加 `mad c0*v.x+c1*v.y+c2*v.z+c3*v.w`(=pos*S);
+`mul(pos,uWVP)` 编译成 `dp4 oPos.x, v0, c0` 单寄存器点积(=pos*S^T)。
+我方初版误写 `mul(pos, uWVP)` 导致实机图像错乱(背景纯色 + 角落三角形 + 对角线碎片), 已修正。
+WVP 常量: uWVP 显式 `register(c0)`, 写 c0-c3(4 寄存器)。
+
+**运行时编译验证(2026-08-08)**: 用真实 d3dx9_43.dll 的 D3DXCompileShader 编译透传 VS 的 HLSL
+(x86 C++ 测试程序): hr=D3D_OK, GetConstantDesc 返回 RegisterSet=VS/RegisterIndex=0/RegisterCount=4
+—— `register(c0)` 被 d3dx9_43.dll 遵守, uWVP 恰在 c0-c3。编译与寄存器均无误。
+
+**第二处坑(2026-08-08, 实机"纯色"): 透传 VS 常驻管线破坏 FVP 像素纹理采样**。
+矩阵修正后图像从"碎片"变成"整屏纯色"。定位: 运行时编译+寄存器+矩阵都正确, 唯一与 gm82dx9 的
+差异是 —— 我们把透传 VS 绑进了【无 shader 的绘制】(GMGraphic 图集/引擎精灵), 而 gm82dx9 默认
+无 shader 时用纯 SetFVF(FFP), 只在用 shader 时才上 VS。VS 绑定 + FVP 像素管线(无 PS)的组合在
+实机不采样纹理 → 全部渲染成顶点色 → 纯色。**修复**: GMGraphic 加 `g_vs_needed` 标志 —— 仅当
+ps-only shader 激活(有 PS 无 VS, ps_3_0 需要 VS 喂 v0/v1)时才在 shader_set/vertex::end 绑透传 VS;
+无 shader 的图集/自绘保持 FVP。GMDirectX9 钩子本来就只在 GetPixelShader()!=null 时才绑 fake VS,
+且 shader_reset 会清 VS, 无此问题。
+
+**HLSL 验证**(fxc, vs_2_0): `uWVP c0(4)`; `dcl_position v0 / dcl_color v1 / dcl_texcoord v2`;
+`dp4 oPos.* v0, c0..c3`(行向量正确); `mov oD0, v1`(color→oD0→ps v1); `mov oT0.xy, v2`(uv→oT0→ps v0)。
+SDF 着色器 ps_3_0 编译验证: `dcl_texcoord v0.xy` + `dcl_color v1` + `dcl_2d s0`, 与透传 VS 输出精确匹配。
+vs_2_0 喂 ps_3_0 合法(D3D9 vs/ps 版本相互独立)。
+
+**实现**:
+- `inject.cpp`: `gm80_fake_ffp_vs`(懒编译) + `gm80_update_fake_ffp_wvp`(每绘制刷 WVP) +
+  `gm80_bind_fake_ffp`(绑 VS+声明) + SetVertexShader 钩子加"无 VS + 有 PS → 仿固定管线 VS"分支;
+  声明切换路径若当前 VS 是本钩子的 fake VS 则每绘制刷一次 WVP(投影可能已变)。
+- GMGraphic: `d3d_adapter.h/cpp` 加 `set_vertex_shader_passthrough(VertexFmt)`(impl8=FVF 固定管线,
+  impl9=透传 VS+声明+WVP); `shader.cpp` ps_profile 无条件 + shader_set/vertex::end 的 ps-only 分支。
+- D3D9 分支不静态链 d3dx9.lib(与 D3DX8 撞名), 透传 VS 用已解析的 s_compile(D3DXCompileShader)编译,
+  WVP 乘法手写 mul4x4。
+
+**已知边界**: 
+- 3D(带光照/雾/镜面)绘制 + ps-only shader 时, 仿固定管线 VS 只做 passthrough, 不做光照/雾——
+  引擎 3D 若在 ps-only shader 下绘制会缺光照(用户 2D 为主, 可接受)。
+- 仿固定管线 VS 无点大小控制(D3DRS_POINTSIZE 只作用于固定管线)——ps-only 下点精灵会退化为 1px。
+- 设备 Reset 后 gm80_fake_ffp_vs/decl 理论失效; GM8 windowed 不会设备丢失(ResetDevice 只对
+  D3DERR_DEVICENOTRESET 真 Reset), 暂不处理, 与既有 gm80_decl_* 生命周期一致。
+
+**编译**: 两工程 `MSBuild *.sln -p:Configuration=Release -p:Platform=x86` ✅ 通过。
+
+**待实测矩阵**:
+1. GM8.0 + GMDirectX9 + GMGraphic, 无任何 shader: 引擎 draw_sprite/draw_text 正常(走 SetFVF, 回归测试)。
+2. 绑带自定义 VS 的 shader(vs_3_0/ps_3_0): 引擎绘制正常, ps_3_0 不再全透明(§18 回归)。
+3. ps-only shader(shader_create 空 VS, 如 SDF 文字): 自动 ps_3_0, GMGraphic 文字/图集正常; 
+   引擎 draw_sprite 在 ps-only 下也正常(走仿固定管线 VS)。
+4. 中途 d3d_set_projection 换视图: 仿固定管线 VS 的 WVP 跟随(每绘制刷)。
+5. D3D8 模式(纯 GMGraphic, 无 GMDirectX9): SDF asm ps_1.4、图集、draw_primitive 全部照旧(回归)。
+
+**最终结论(2026-08-09, 实机验证 Nature Edition, 已修复达成 SM3.0)**:
+- 纯色根因 = **ps_3_0 + vs_2_0 透传 VS 实机全透明**。vs_2_0 输出是隐式 oT0/oD0(SM2 体系),
+  没有 ps_3.0 的 vN 输入路由认的显式语义; 只有 vs_3.0 用 dcl 声明输出语义(dcl_color o1 /
+  dcl_texcoord o2, fxc 验证)才能喂进 ps_3.0 的 v0/v1。**结论: SM2(vs_2.0)顶点输出不能配
+  SM3(ps_3.0)像素输入, VS 必须同为 vs_3.0。**
+- **修复(最终)**: ① 两个透传/仿固定 VS 全部改为 `vs_3_0` 编译(inject.cpp + d3d_adapter9.cpp);
+  ② shader_create ps-only 放开 `ps_profile()`。实机全部正常: ps_3.0(HLSL Gray/Gamma 等)与
+  asm ps_1.4(加载屏 psTest 等)都正常 → **ps-only 也能用 SM3.0 达成**。
+- 诊断过程(钩子日志 + shader_set/create 日志 + passthrough WVP 日志): 游戏全部 ps-only;
+  passthrough VS 的 WVP 实测正确(W=identity, V≈identity, P=2D 正交, WVP_44=1);
+  矩阵约定 mul(uWVP,pos) 正确。问题只在 VS 版本(SM2 vs SM3)。

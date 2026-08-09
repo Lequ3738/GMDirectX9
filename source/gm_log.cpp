@@ -4,9 +4,8 @@
 #include <stdio.h>
 #include <string.h>
 
-// [GM80] 日志实现: 写 %TEMP%\gm82dx9_port.log(追加) + OutputDebugStringA。
-// 注意: DllMain/gm80_apply_patches 运行在 loader lock 下 —— 只用 kernel32 文件函数 + 纯栈上 sprintf,
-// 避免 CRT fopen/fprintf(可能取 loader lock 而死锁)。sprintf_s/vsprintf_s 纯计算, 安全。
+// [GM80] 日志写 %TEMP%\gm82dx9_port.log(追加) + OutputDebugStringA。
+// loader lock 下只用 kernel32 文件函数 + 纯栈上 sprintf, 避免 CRT fopen/fprintf 死锁。
 #if GM80_LOG
 int g_patch_failures = 0;
 

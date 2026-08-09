@@ -1,11 +1,10 @@
 #pragma once
-// [GM80] 测试日志模块(2026-08-05)。结构对齐 GMSave 的 gm_log.h/gm_log.cpp。
-// 实现见 gm_log.cpp。写 %TEMP%\gm82dx9_port.log(追加) + OutputDebugStringA(DbgView 实时看)。
-// 关掉日志: 把 GM80_LOG 改成 0(全部编译掉, GM_WRITE 退回裸 WriteProcessMemory)。
+// [GM80] 测试日志模块(结构对齐 GMSave)。GM80_LOG=0 时整体编译掉, GM_WRITE 退回裸 WriteProcessMemory。
+// 写 %TEMP%\gm82dx9_port.log(追加) + OutputDebugStringA(DbgView 实时看)。
 #include <windows.h>
 
 #ifndef GM80_LOG
-#define GM80_LOG 0   // [GM80] 2026-08-06 插件收尾: 关掉日志(不再写 %TEMP%\gm82dx9_port.log)
+#define GM80_LOG 0   // [GM80] 插件收尾: 关掉日志
 #endif
 
 #if GM80_LOG

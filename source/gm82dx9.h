@@ -73,8 +73,7 @@ union messy_matrix_glue {
     int pointer;        
 };
 
-// [GM80] surface 数组每项 16 字节（GMAPI GMSURFACE: textureId,width,height,exists），无 zbuffer 字段。
-// 原 8.1 版带 zbuffer 字段（20B/项），若不改则 &gm_surfaces[id] 步长错、读到垃圾。
+// [GM80] GMSURFACE 16B/项(textureId,width,height,exists), 无 zbuffer; 8.1 是 20B, 步长必须对齐。
 struct GMSurface {
     unsigned int texture, width, height;
     bool exists;

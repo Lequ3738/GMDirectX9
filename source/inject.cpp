@@ -15,28 +15,8 @@ D3DPRESENT_PARAMETERS d3d_parameters = {
 };
 
 // ============================================================================================
-// GM80 移植说明（2026-08-05，已更新：vtable 重映射完成）
-// --------------------------------------------------------------------------------------------
-// 本文件是 gm82dx9 的注入核心（DllMain 内把 runner 的 Direct3D8 换成 Direct3D9）。
-//
-// ✅ 已完成（2026-08-06 收尾，全部实测通过——多个真实 GM8 游戏应用后无图形问题）：
-//   - D3D8→D3D9 vtable 槽位重映射（~150 个调用点全部换为 8.0 地址，find_bytes 全二进制交叉验证通过）
-//   - Direct3DCreate8→9 重定向（D3DCreate@0x484df4 的 call@0x484dff）+ D3D_SDK_VERSION（0x4a1e13 push 32）
-//   - CreateDevice 包装（sub_4A1DA0 call@0x4a1f1f + 0x4a1ee7）+ room 读取（rooms 数组 0x58d4cc）
-//     + 深度缓冲(EnableAutoDepthStencil D24S8/D16) + HWVP(0x22→0x42)
-//   - 屏幕捕获/表面复制包装（GetDisplayMode/CreateImageSurface/GetBackBuffer/CopyRects/SetRenderTarget/GetRenderTarget）
-//   - D3DCAPS 接管（GetDeviceCaps 参数改指 &d3d_caps）+ D3DX 14 全局兜底(0x593868–0x59389c)
-//   - Reset 挂钩：设备丢失恢复(TestCooperativeLevel==NOTRESET 真 Reset) + 卸载安全(DllMain DETACH 恢复 vtable)
-//   - CheckDeviceMultiSampleType 接管（D3D9 多第 6 参 pQualityLevels → 包装补 &quality）
-//   - 数学 FPU trampoline：实测 precision=1，8.0 不需要（D3DCREATE_FPU_PRESERVE 生效）
-//   - present-params：8.0 栈构造 → 包装内重建（非 8.1 的全局重定向，机制不同）
-// 注：文件下方仍保留若干 8.1 专属段落的注释（标 GM80-TODO 或已确认），均为 8.0 确认不需要或
-//     已用其它方案解决，注释仅是移植记录。详见 PORTING_NOTES.md。
-//
-// 重映射方法（SOP §1d）：每个 8.1 补丁点 =（方法, D3D8 槽位），在 8.0 对应函数内按
-// `FF 50/FF 90 <槽位>` 定位调用点，反汇编核对语义后替换地址。补丁值与指令编码两版本一致。
-// 本轮用修复后的 find_bytes 对每个槽位做全二进制扫描，确认 8.0 全部 device 调用点都已覆盖
-// （D3D 模块外的同槽位命中经核实均为非 D3D 接口：自定义 Delphi 接口/VCL/声音等）。
+// GM80 移植说明: 本文件是 gm82dx9 注入核心(DllMain 把 runner 的 Direct3D8 换成 Direct3D9)。
+// 已完成并实测通过: vtable 槽位重映射/CreateDevice 包装/D3DCAPS 接管等, 详见 PORTING_NOTES.md。
 // ============================================================================================
 
 // [GM80] 8.0 的 D3DX 是动态 LoadLibrary，runner 的加载器(sub_49A254)用字符串 "\D3DX8.dll" 拼路径。
@@ -153,10 +133,7 @@ HRESULT WINAPI CopyRects(IDirect3DDevice9 *dev,
     destRect.top = pDestPointsArray->y;
     destRect.right = destRect.left + (pSourceRectsArray->right - pSourceRectsArray->left);
     destRect.bottom = destRect.top + (pSourceRectsArray->bottom - pSourceRectsArray->top);
-    // [GM80] AddDirtyRect 不需要(2026-08-06 分析确认): ① D3D9 表面无法反向取父纹理(无 GetContainer),
-    // 无法调用 IDirect3DTexture9::AddDirtyRect; ② CopyRects 目标多为 default-pool 表面(视频内存直写);
-    // ③ 若目标为 managed 纹理, D3DXLoadSurfaceFromSurface 内部 LockRect 已把资源标记脏, 下次 SetTexture
-    //    整纹理重传, 正确性无碍(AddDirtyRect 仅是局部重传的性能优化)。
+    // [GM80] AddDirtyRect 不需要: D3D9 表面无法反向取父纹理, 目标多为 default-pool 表面, 正确性无碍。
     HRESULT hr = D3DXLoadSurfaceFromSurface(pDestinationSurface, nullptr, &destRect, pSourceSurface, nullptr,
                                             pSourceRectsArray, D3DX_FILTER_NONE, 0);
 #if GM80_LOG
@@ -194,19 +171,140 @@ void WINAPI regain_device() {
     (*runner_display_reset)();
 }
 
-// [GM80] SetVertexShader 包装 —— runner 每次 draw 调 SetVertexShader(FVF), D3D9 用 SetFVF 等价。
-// 纯 patch 版不再支持插件侧 shader(交给 GMGraphic 等外部 DLL 直接操作 0x58d388 的 D3D9 设备),
-// 原 shaders.cpp 里 using_shader/vertex-declaration 分支已随 shader 功能一并移除。
-// 不记日志(每帧调用数千次会刷爆日志文件)。
+// [GM80] SetVertexShader 包装: runner 每绘制 SetVertexShader(FVF)。有自定义 VS(GMGraphic)时
+// FVF 重置翻译成 SetVertexDeclaration 保持 VS 绑定, 否则透传 SetFVF。不记日志(每帧数千次)。
+
+// 引擎三种 FVF 顶点布局: shape 16B(pos+color) / 2d 24B(+uv) / 3d 36B(pos+normal+color+uv)。
+static const D3DVERTEXELEMENT9 gm80_elems_shape[] = {
+        {0, 0, D3DDECLTYPE_FLOAT3, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_POSITION, 0},
+        {0, 12, D3DDECLTYPE_D3DCOLOR, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_COLOR, 0},
+        D3DDECL_END()
+};
+static const D3DVERTEXELEMENT9 gm80_elems_2d[] = {
+        {0, 0, D3DDECLTYPE_FLOAT3, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_POSITION, 0},
+        {0, 12, D3DDECLTYPE_D3DCOLOR, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_COLOR, 0},
+        {0, 16, D3DDECLTYPE_FLOAT2, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_TEXCOORD, 0},
+        D3DDECL_END()
+};
+static const D3DVERTEXELEMENT9 gm80_elems_3d[] = {
+        {0, 0, D3DDECLTYPE_FLOAT3, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_POSITION, 0},
+        {0, 12, D3DDECLTYPE_FLOAT3, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_NORMAL, 0},
+        {0, 24, D3DDECLTYPE_D3DCOLOR, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_COLOR, 0},
+        {0, 28, D3DDECLTYPE_FLOAT2, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_TEXCOORD, 0},
+        D3DDECL_END()
+};
+static IDirect3DVertexDeclaration9* gm80_decl_shape = nullptr;
+static IDirect3DVertexDeclaration9* gm80_decl_2d = nullptr;
+static IDirect3DVertexDeclaration9* gm80_decl_3d = nullptr;
+
+static HRESULT gm80_ensure_decl(IDirect3DDevice9* dev, IDirect3DVertexDeclaration9** out,
+                                const D3DVERTEXELEMENT9* elems) {
+    if (*out == nullptr) {
+        HRESULT hr = dev->CreateVertexDeclaration(elems, out);
+        if (FAILED(hr)) return hr;
+    }
+    return S_OK;
+}
+
+// [GM80] 仿固定管线 VS: ps_3_0 的输入(v0/v1)只能由 VS 喂, 故自定义 PS 已绑而无 VS 时绑定,
+// 做 FFP 等价 pos*WVP + 透传 color/uv。uWVP 行主序 → 写 mul(uWVP,pos); 编成 vs_3_0 见 PORTING_NOTES。
+static IDirect3DVertexShader9* gm80_fake_ffp_vs = nullptr;
+static const char gm80_fake_ffp_hlsl[] =
+    "float4x4 uWVP : register(c0);"                                                                 "\n"
+    "struct VS_IN { float4 pos: POSITION; float4 color: COLOR0; float2 uv: TEXCOORD0; };"          "\n"
+    "struct VS_OUT { float4 pos: POSITION; float4 color: COLOR0; float2 uv: TEXCOORD0; };"         "\n"
+    "VS_OUT main(VS_IN v) {"                                                                       "\n"
+    "  VS_OUT o;"                                                                                  "\n"
+    "  o.pos = mul(uWVP, v.pos);"                                                                  "\n"
+    "  o.color = v.color;"                                                                         "\n"
+    "  o.uv = v.uv;"                                                                               "\n"
+    "  return o;"                                                                                  "\n"
+    "}";
+
+static HRESULT gm80_ensure_fake_ffp_vs(IDirect3DDevice9* dev) {
+    if (gm80_fake_ffp_vs) return S_OK;
+    ID3DXBuffer* code = nullptr, * errs = nullptr;
+    HRESULT hr = D3DXCompileShader(gm80_fake_ffp_hlsl, (UINT)sizeof(gm80_fake_ffp_hlsl) - 1,
+        nullptr, nullptr, "main", "vs_3_0", 0, &code, &errs, nullptr);
+    if (FAILED(hr)) {
+        if (errs) errs->Release();
+        return hr;
+    }
+    hr = dev->CreateVertexShader((DWORD*)code->GetBufferPointer(), &gm80_fake_ffp_vs);
+    code->Release();
+    return hr;
+}
+
+// 刷新仿固定管线 VS 的 WVP 常量(c0 = W*V*P, 行向量约定)。钩子在 DrawPrimitiveUP 前触发,
+// 此刻引擎本绘制所需的 SetTransform 已全部完成, GetTransform 必为当前值。
+static HRESULT gm80_update_fake_ffp_wvp(IDirect3DDevice9* dev) {
+    D3DXMATRIX world, view, proj, wvp;
+    dev->GetTransform(D3DTS_WORLD, &world);
+    dev->GetTransform(D3DTS_VIEW, &view);
+    dev->GetTransform(D3DTS_PROJECTION, &proj);
+    D3DXMatrixMultiply(&wvp, &world, &view);
+    D3DXMatrixMultiply(&wvp, &wvp, &proj);
+    return dev->SetVertexShaderConstantF(0, &wvp._11, 4);
+}
+
+// 绑仿固定管线 VS: 声明按引擎 FVF 选 + WVP 常量 + VS。uWVP 是唯一 uniform → 编译器分配 c0-c3。
+static HRESULT gm80_bind_fake_ffp(IDirect3DDevice9* dev, DWORD fvf) {
+    IDirect3DVertexDeclaration9** pdecl = nullptr;
+    const D3DVERTEXELEMENT9* elems = nullptr;
+    if (fvf == (D3DFVF_XYZ | D3DFVF_DIFFUSE))                          { pdecl = &gm80_decl_shape; elems = gm80_elems_shape; }
+    else if (fvf == (D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1))       { pdecl = &gm80_decl_2d;    elems = gm80_elems_2d; }
+    else if (fvf == (D3DFVF_XYZ | D3DFVF_NORMAL | D3DFVF_DIFFUSE | D3DFVF_TEX1)) { pdecl = &gm80_decl_3d; elems = gm80_elems_3d; }
+    else return D3DERR_INVALIDCALL;
+    HRESULT hr = gm80_ensure_fake_ffp_vs(dev);
+    if (FAILED(hr)) return hr;
+    hr = gm80_ensure_decl(dev, pdecl, elems);
+    if (FAILED(hr)) return hr;
+    hr = gm80_update_fake_ffp_wvp(dev);
+    if (FAILED(hr)) return hr;
+    hr = dev->SetVertexShader(gm80_fake_ffp_vs);
+    if (FAILED(hr)) return hr;
+    return dev->SetVertexDeclaration(*pdecl);
+}
+
 HRESULT WINAPI SetVertexShader(IDirect3DDevice9 *dev, DWORD fvf) {
+    IDirect3DVertexShader9* vs = nullptr;
+    if (SUCCEEDED(dev->GetVertexShader(&vs)) && vs != nullptr) {
+        // 自定义 VS 已绑定: 引擎的 FVF 重置 → 声明切换, VS 保持。
+        // 注: D3D9 的 GetVertexShader 不 AddRef 返回对象, 无需 Release(SDK 示例同款 save/restore)。
+        HRESULT hr;
+        IDirect3DVertexDeclaration9* decl = nullptr;
+        if (fvf == (D3DFVF_XYZ | D3DFVF_DIFFUSE)) {
+            hr = gm80_ensure_decl(dev, &gm80_decl_shape, gm80_elems_shape);
+            decl = gm80_decl_shape;
+        } else if (fvf == (D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1)) {
+            hr = gm80_ensure_decl(dev, &gm80_decl_2d, gm80_elems_2d);
+            decl = gm80_decl_2d;
+        } else if (fvf == (D3DFVF_XYZ | D3DFVF_NORMAL | D3DFVF_DIFFUSE | D3DFVF_TEX1)) {
+            hr = gm80_ensure_decl(dev, &gm80_decl_3d, gm80_elems_3d);
+            decl = gm80_decl_3d;
+        } else {
+            return D3DERR_INVALIDCALL;   // 未知 FVF + 自定义 VS: 引擎忽略返回值, 保持上次声明
+        }
+        if (FAILED(hr)) return hr;
+        // [2026-08-08] 若当前 VS 是本钩子绑的仿固定管线 VS(ps-only 场景), 每绘制刷一次 WVP
+        // (投影可能已变, 如换视图/d3d_set_projection)。用户自定义 VS 不在此列(其常量自管)。
+        if (vs == gm80_fake_ffp_vs) {
+            hr = gm80_update_fake_ffp_wvp(dev);
+            if (FAILED(hr)) return hr;
+        }
+        return dev->SetVertexDeclaration(decl);
+    }
+    // [GM80] 仿固定管线 VS 兜底: 无自定义 VS 但自定义 PS 激活(ps-only)时绑定喂 v0/v1;
+    // 实测 ps_3_0 仍全透明 → GMGraphic 已回退 ps_2_0, 本分支留作 vs_3_0 透传 VS 实验。
+    IDirect3DPixelShader9* ps = nullptr;
+    if (SUCCEEDED(dev->GetPixelShader(&ps)) && ps != nullptr) {
+        return gm80_bind_fake_ffp(dev, fvf);
+    }
     return dev->SetFVF(fvf);
 }
 
-// [GM80] SetViewport 接管(2026-08-06, 表面渲染 viewport 钳制): D3D9 的 viewport 超出
-// render target 时【只裁剪不收缩】→ 表面渲染(如 400x225 世界表面)时, runner 按视图端口
-// (窗口尺寸 1920x1080)设 viewport、投影按视图(400x225)铺满整个视口, 但 render target 只有
-// 400x225 → 只捕到左上角一小块, 内容被放大几倍。D3D8 会把 viewport 钳到 render target。
-// 这里把 D3D_SetViewport 的设备调用点(0x4a2432)重定向到本函数, 钳到当前 render target 尺寸。
+// [GM80] SetViewport 接管: D3D9 viewport 超出 render target 只裁剪不收缩 → 表面渲染只捕左上角。
+// 把 D3D_SetViewport 调用点(0x4a2432)重定向到本函数, 钳到当前 render target 尺寸。
 HRESULT WINAPI SetViewport_inj(IDirect3DDevice9 *dev, D3DVIEWPORT9 *vp) {
     IDirect3DSurface9 *rt = nullptr;
     if (SUCCEEDED(dev->GetRenderTarget(0, &rt))) {
@@ -231,19 +329,14 @@ HRESULT WINAPI SetViewport_inj(IDirect3DDevice9 *dev, D3DVIEWPORT9 *vp) {
 short old_cw = 0;
 short new_cw = 0;
 
-// [GM80] Reset 接管(2026-08-05 实机确认): 8.0 runner 在 INNER_display_set_size 栈上构造 D3D8 布局的
-// present params 传给 device Reset(D3D8 槽 0x38→补丁到 D3D9 槽 0x40), D3D9 按 D3D9 布局读 → 字段错位
-// (hDeviceWindow 读到 D3D8.Windowed 等) → Reset 失败返回 0 → d3d_start 弹 "Failed to use 3D mode"。
-// 方案: CreateDevice 成功后把设备 vtable 槽 0x40 改指向 ResetDevice 包装, 用创建时的干净 D3D9 pp 副本
-// 调真实 Reset(D3D9 要求 Reset 参数与 CreateDevice 一致)。一次挂钩覆盖 d3d_start/d3d_end/display_set_size/display_reset 等全部 Reset 调用点。
+// [GM80] Reset 接管: 8.0 runner 传 D3D8 布局 present params 给 Reset → D3D9 字段错位必失败。
+// CreateDevice 成功后把 vtable 槽 0x40 改指 ResetDevice 包装, 用创建时的干净 pp9 副本调真 Reset。
 static D3DPRESENT_PARAMETERS g_pp9;   // 设备创建时的 pp9 副本(与 CreateDevice 完全一致 → Reset 必成功)
 static HWND g_window = nullptr;       // CreateDevice 传入的有效窗口
 static HRESULT (WINAPI* real_reset)(IDirect3DDevice9*, D3DPRESENT_PARAMETERS*) = nullptr;  // 原始 D3D9 Reset
 
-// [GM80] CheckDeviceMultiSampleType 接管(2026-08-06): IDA 验证 sub_4A5054@0x4a50ef 调 D3D 对象槽 0x2C
-// = CheckDeviceMultiSampleType。D3D9 版本比 D3D8 多第 6 参 pQualityLevels, 8.0 runner 按 D3D8 只传 5 参
-// → D3D9 读栈垃圾当输出指针写 → 潜在崩溃(真实游戏实测未触发, 保险起见接管)。
-// 方案: D3D 对象 vtable 槽 0x2C → 包装(补 &quality)。
+// [GM80] CheckDeviceMultiSampleType 接管: D3D9 比 D3D8 多第 6 参 pQualityLevels, 8.0 只传 5 参
+// → D3D9 写栈垃圾。D3D 对象 vtable 槽 0x2C → 包装(补 &quality)。
 static HRESULT (WINAPI* real_check_ms)(IDirect3D9*, UINT, D3DDEVTYPE, D3DFORMAT, BOOL, D3DMULTISAMPLE_TYPE, DWORD*) = nullptr;
 
 HRESULT WINAPI CheckDeviceMultiSampleType_wrap(IDirect3D9 *d3d9, UINT Adapter, D3DDEVTYPE DeviceType,
@@ -255,14 +348,8 @@ HRESULT WINAPI CheckDeviceMultiSampleType_wrap(IDirect3D9 *d3d9, UINT Adapter, D
 }
 
 HRESULT WINAPI ResetDevice(IDirect3DDevice9 *dev, D3DPRESENT_PARAMETERS *pParams) {
-    // [GM80] 设备丢失恢复(2026-08-06, 对齐 gm82dx9 regain_device):
-    //   IDA 验证(8.0 D3D_CreateDevice @0x4a2708): Present(0x4a27ab)失败 → INNER_display_set_size
-    //   (0x4a27be) → device Reset(槽 0x40)。即 runner 在设备丢失时靠 Reset 恢复。
-    //   这里用 TestCooperativeLevel 判定:
-    //     D3DERR_DEVICENOTRESET → 设备丢失且可恢复 → 真 Reset(g_pp9 与 CreateDevice 一致 → 必成功)
-    //     S_OK                 → 设备正常 → no-op(避免 d3d_start/d3d_end 每帧真 Reset 黑屏)
-    //     D3DERR_DEVICELOST    → 暂时不可恢复 → no-op(等下一帧)
-    //   GM8 只支持无边框全屏(2026-08-06 确认), 恢复时保持 windowed。
+    // [GM80] 设备丢失恢复: Present 失败 → INNER_display_set_size → Reset。TestCooperativeLevel 判定:
+    // NOTRESET=真 Reset(必成功, g_pp9 与 CreateDevice 一致); S_OK/LOST=no-op(避免每帧真 Reset 黑屏)。
     (void)pParams;
     HRESULT tcl = dev->TestCooperativeLevel();
     if (tcl == D3DERR_DEVICENOTRESET && real_reset) {
@@ -275,11 +362,8 @@ HRESULT WINAPI ResetDevice(IDirect3DDevice9 *dev, D3DPRESENT_PARAMETERS *pParams
     return S_OK;
 }
 
-// [GM80] DLL 卸载安全(2026-08-06, 对齐 gm82dx9 last_resort):
-//   IDA 验证: 8.0 卸载扩展 DLL 走 INNER_external_free(0x518764)循环 FreeLibrary。
-//   我们此前把设备 vtable 槽 0x40 改指 ResetDevice(DLL 内), 若 DLL 卸载而设备仍活着,
-//   runner 再调 Reset 会跳未映射内存 → 崩溃。此函数在 DllMain(DLL_PROCESS_DETACH) 恢复 vtable。
-//   用 __try/__except 兜底(设备可能已释放), 且仅当槽 0x40 仍是我们的钩子才恢复。
+// [GM80] DLL 卸载安全: DLL 卸载而设备仍活着时, runner 再调 Reset 会跳未映射内存。
+// DllMain(DETACH) 恢复 vtable 槽 0x40(仅当仍是我们的钩子), __try/__except 兜底设备已释放。
 void gm80_restore_reset_hook(void) {
     __try {
         IDirect3DDevice9 *dev = *(IDirect3DDevice9 **)0x58d388;
@@ -327,53 +411,13 @@ HRESULT WINAPI CreateDevice(IDirect3D9 *d3d9, UINT Adapter, D3DDEVTYPE DeviceTyp
     }
 #endif
 
-	// [GM80] 分辨率可调修复(2026-08-06): 原实现(下方注释)把 backbuffer 缩到首个房间的
-	// 视图尺寸, 之后 room_set_view 把渲染尺寸/视口改成多大, 都被这个背缓冲夹住 →
-	// 可见区域永远卡在初始尺寸(本游戏 800x450, 左上角, 其余纯黑)。
-	// IDA 证据(GM8.0 空工程.exe):
-	//   - Present 源矩形 = (0,0,renderWidth,renderHeight), 即 GMDIRECT3DINFO 0x58d38c/0x58d390
-	//     (D3D_CreateDevice@0x4a2708)。
-	//   - 换分辨率走 sub_4A236C@0x4a236c: 只更新 renderWidth/Height + D3D_SetViewport, 不调 Reset
-	//     → backbuffer 尺寸自创建后不变。
-	//   - D3D8 下 runner 的 sub_4A1DA0 用显示器尺寸(GetDisplayMode)创建 backbuffer, 恒 ≥ 任何
-	//     渲染尺寸 → 换分辨率正常。故这里必须保持 runner 传入的 backbuffer 尺寸(显示器), 不缩。
-	// 原代码(2026-08-05 加入, 现删除):
-	/*
-	// get window size from first room
-	// [GM80] 8.1: first_room_id = **(int**)0x8452d4; rooms = (*(char***)0x686a4c)[id]
-	// 8.0: rooms 数组 = 0x58d4cc（id→room 指针，count=0x58d4d4，GMAPI/INNER_room_set_persistent 确认）；
-	//      首个房间 id 取 0（GM 房间从 0 编号）。room 结构体偏移（[0x40] views、[3]/[4] 宽高、+0x44 视图）已确认与 8.1 一致。
-	int first_room_id = 0;
-	char *room_ptr = (*(char***)0x58d4cc)[first_room_id];
-	int desired_width = 0, desired_height = 0;
-	if (room_ptr[0x40]) {
-		// views
-		for (int i = 0; i < 8; i++) {
-			int *view_ptr = *(int**)(room_ptr + 0x44 + i * 4);
-			int port_width = view_ptr[6] + view_ptr[8];
-			int port_height = view_ptr[7] + view_ptr[9];
-			if (port_width > desired_width)
-				desired_width = port_width;
-			if (port_height > desired_height)
-				desired_height = port_height;
-		}
-	} else {
-		// no views
-		desired_width = ((int*)room_ptr)[3];
-		desired_height = ((int*)room_ptr)[4];
-	}
-	if (desired_width != 0 && desired_height != 0 && desired_width < present_params->BackBufferWidth && desired_height < present_params->BackBufferHeight) {
-		present_params->BackBufferWidth = desired_width;
-		present_params->BackBufferHeight = desired_height;
-	}
-	*/
+	// [GM80] 分辨率可调修复: 保持 runner 传入的 backbuffer 尺寸(显示器), 不缩到首个房间视图
+	// (8.0 换分辨率不调 Reset, backbuffer 恒不变; 缩了会被夹住, 可见区永远卡在初始尺寸)。
 
 #if GM80_LOG
     gm_log("  backbuffer -> %ux%u (windowed, 保持 runner 传入尺寸, 不再缩到首个房间)",
            present_params ? present_params->BackBufferWidth : 0, present_params ? present_params->BackBufferHeight : 0);
-    // D3DX 接管自检: sub_49A254 把解析出的函数写入 14 个全局 0x593868–0x59389c。
-    // 位图非零 => 加载器已运行; 若同时 d3dx9_43.dll 已加载 => 这些就是 D3DX9 函数(补丁生效)。
-    // 全零 => 加载器尚未运行(补丁还没被消费, 需等运行时再看)或 DLL 名补丁没生效。
+    // D3DX 接管自检: 位图非零 => 加载器已运行且已解析 D3DX9 函数; 全零 => 补丁尚未被消费。
     {
         void **dx = (void**)0x593868;
         unsigned bmp = 0;
@@ -383,11 +427,7 @@ HRESULT WINAPI CreateDevice(IDirect3D9 *d3d9, UINT Adapter, D3DDEVTYPE DeviceTyp
     }
 #endif
     
-    // [GM80] 8.0 runner 在栈上构造的是 D3D8 布局的 present params —— D3D8 没有 MultiSampleQuality 字段,
-    // 从 MultiSampleType 起字段在 D3D9 视角全部错位: D3D9.hDeviceWindow(0x1C)读到的是 D3D8.Windowed,
-    // 实机是 0xFFFFFFFF 栈垃圾; D3D9.Windowed(0x20)读到的是 D3D8.EnableAutoDepthStencil。传给 CreateDevice
-    // 即 D3DERR_NOTAVAILABLE(0x8876086C)。只有开头 4 个字段(0x00-0x0C)两版布局一致, 可安全采用。
-    // 探针(2026-08-05, d3d9probe)确认: 有效窗口 + 干净参数的 HAL 设备本机可正常创建(全屏/窗口皆 D3D_OK)。
+    // [GM80] runner 栈上构造 D3D8 布局 present params → D3D9 字段错位。只采用开头 4 字段(布局一致), 其余干净重建 pp9。
     D3DPRESENT_PARAMETERS pp9;
     memset(&pp9, 0, sizeof(pp9));
     if (present_params) {
@@ -423,9 +463,7 @@ HRESULT WINAPI CreateDevice(IDirect3D9 *d3d9, UINT Adapter, D3DDEVTYPE DeviceTyp
                hFocusWindow ? IsWindow((HWND)hFocusWindow) : -1);
     }
 #endif
-    // [GM80] 硬件 VP: 8.0 runner 传 BehaviorFlags=0x22(SWVP|FPU_PRESERVE), 而 gm82dx9-on-8.2 是 0x42(HWVP)。
-    // 顶点着色器要走硬件必须在 CreateDevice 用 HWVP —— 这里把 0x20(SWVP) 换成 0x40(HWVP), 保留 FPU_PRESERVE。
-    // 若 HWVP 创建失败(老显卡/远程桌面)则回退原始 flags(SWVP)。
+    // [GM80] 硬件 VP: 把 runner 的 0x22(SWVP|FPU_PRESERVE) 换成 0x42(HWVP), 失败则回退原始 flags。
     DWORD bf_orig = BehaviorFlags;
     DWORD bf_hw = (bf_orig & ~D3DCREATE_SOFTWARE_VERTEXPROCESSING) | D3DCREATE_HARDWARE_VERTEXPROCESSING;
     DWORD bf_used = bf_hw;
@@ -705,10 +743,8 @@ const uint8_t reset_patch[] = {
 
 // [GM80] HINSTANCE my_handle 定义已移至根目录 dllmain.cpp(声明在 gm82dx9.h)
 
-// called when the dll is unloaded
-// [GM80] 卸载安全已在 DllMain(DLL_PROCESS_DETACH) 用 gm80_restore_reset_hook() 实现(2026-08-06,
-// 对齐 gm82dx9 的 last_resort)。此 last_resort_impl/last_resort 是 8.1 原版的裸汇编挂钩, 8.0 不安装
-// 该挂钩(0x5795c5), 为死代码。体内 8.1 地址(0x56c094/0x61ede0/0x561bb0/0x40dd98)在 8.0 上不能用, 置空。
+// 8.1 原版裸汇编卸载挂钩(0x5795c5), 8.0 不安装(死代码); 卸载安全由 DllMain DETACH 的
+// gm80_restore_reset_hook() 实现。体内 8.1 地址在 8.0 上不能用, 置空。
 void WINAPI last_resort_impl(HANDLE hLibModule) {
     (void)hLibModule;
     return;
@@ -752,20 +788,15 @@ bool gm80_apply_patches(void) {
 #endif
 
     // =========================================================================================
-    // [GM80] DllMain 补丁入口。下方大部分地址已重映射到 8.0（vtable 表见后文 PATCH_* 段）。
-    // 注释禁用的 8.1 专属段落(present-params/D3DX/数学/regain 等)均已用 8.0 方案解决或确认不需要
-    // (见各段 GM80-确认 标记), 不会在 8.0 上误写。已实现的 8.0 核心：
-    //   Direct3DCreate8→9（D3DCreate@0x484df4 的 call@0x484dff）+ SDK 版本（0x4a1e13 push 32）
-    //   CreateDevice 包装（sub_4A1DA0 call@0x4a1f1f）
+    // [GM80] DllMain 补丁入口。下方地址已重映射到 8.0, 注释禁用的 8.1 段落为移植记录不会误写。
     // =========================================================================================
     HANDLE proc = GetCurrentProcess();
 
     void *ptr;
     uint16_t offset;
 
-    // [GM80] SDK 版本：8.0 在 sub_4A1DA0 内 `push 0DCh` @0x4a1e13（D3D_SDK_VERSION=220），改 `push 0x20`(32)。
-    // 必须用 5 字节 `68 20 00 00 00`（与原 push imm32 同长）。原补丁 2 字节 `6A 20` 留下 3 字节 `00 00 00`，
-    // 被解码成 `add [eax],al`，在 eax=0x20(色深 32 检查)时写地址 0x20 → 访问违例崩溃（实机复现，2026-08-05）。
+    // [GM80] SDK 版本: 0x4a1e13 push 0x20(32)。必须 5 字节 `68 20 00 00 00` 与原 push 同长;
+    // 2 字节 `6A 20` 会留下 3 字节被解码成 `add [eax],al` → 写 0x20 崩溃(实机复现)。
     {
         uint8_t push32[] = {0x68, 0x20, 0x00, 0x00, 0x00};
         WriteProcessMemory(proc, (void *)(0x4a1e13), push32, 5, nullptr);
@@ -778,53 +809,19 @@ bool gm80_apply_patches(void) {
         WriteProcessMemory(proc, (void *)(0x484e00), &ptr, 4, nullptr);
     }
 
-    // [GM80] present-params 已接管(2026-08-06)：8.1 是把 runner 的 present-params 全局(0x85B38C)引用改指
-    // d3d_parameters；8.0 的 present params 是在 sub_4A1DA0(0x4a1ea2 附近)与 INNER_display_set_size(0x4a228f
-    // 附近)栈上构造，机制不同 → 改为在 CreateDevice 包装内重建干净 D3D9 pp9（见下方 CreateDevice 包装）。
-    // 原"格式来源改读 d3d_parameters"方案用于 set_alpha_buffer，纯 patch 版已移除该导出，不再需要。
-    // 以下 8.1 地址段在 8.0 不可用，注释禁用保留作移植记录：
-    // // D3DPRESENT_PARAMETERS setup
-    // ptr = &d3d_parameters;
-    // WriteProcessMemory(proc, (void *) (0x61edfd + 1), &ptr, 4, nullptr);
-    // WriteProcessMemory(proc, (void *) (0x61faa1 + 1), &ptr, 4, nullptr);
-    // WriteProcessMemory(proc, (void *) (0x61fad0 + 1), &ptr, 4, nullptr);
-    // WriteProcessMemory(proc, (void *) (0x61fb15 + 1), &ptr, 4, nullptr);
-    // uint8_t short_jmp[] = {0xeb, 0x26};
-    // WriteProcessMemory(proc, (void *) (0x61eece), short_jmp, 2, nullptr);
-    // uint8_t nops[] = {0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
-    // offset = 0x18;
-    // WriteProcessMemory(proc, (void *) (0x61ef11 + 2), &offset, 1, nullptr);
-    // WriteProcessMemory(proc, (void *) (0x61ef09), nops, 3, nullptr);
-    // WriteProcessMemory(proc, (void *) (0x61ef19), nops, 7, nullptr);
-    // WriteProcessMemory(proc, (void *) (0x61ef25), nops, 3, nullptr);
-    // // set AutoDepthStencilFormat on fail
-    // offset = 0x28;
-    // WriteProcessMemory(proc, (void *) (0x61efb2 + 2), &offset, 1, nullptr);
-    // // set SwapEffect on fail
-    // offset = 0x18;
-    // WriteProcessMemory(proc, (void *) (0x61f015 + 2), &offset, 1, nullptr);
+    // [GM80] present-params 已接管: 8.0 的 present params 在栈上构造(无全局可重定向) → CreateDevice
+    // 包装内重建干净 D3D9 pp9。以下 8.1 地址段不可用, 已删除。
 
-    // [GM80] D3DCAPS 接管：8.0 调 device GetDeviceCaps（槽 0x1C，两版本相同无需改槽），
-    // 但 D3D9 的 D3DCAPS9 比 D3DCAPS8 大，runner 的 caps 缓冲(unk_6C7244)会溢出——必须改指插件 d3d_caps。
-    // 两个 `push offset unk_6C7244`（68 44 72 6C 00）：0x4a1f3e(sub_4A1DA0)、0x4a2309(INNER_display_set_size)。
-    // 注：d3d_caps 是插件全局（D3DCAPS9 大小），runner 读取 MaxTextureWidth 等字段偏移与 D3DCAPS9 对齐。
+    // [GM80] D3DCAPS 接管: D3DCAPS9 比 D3DCAPS8 大, runner 的 caps 缓冲会溢出 → 改指插件 d3d_caps。
+    // 两个 push offset unk_6C7244 站点: 0x4a1f3e、0x4a2309。
     ptr = &d3d_caps;
     WriteProcessMemory(proc, (void *)(0x4a1f3e + 1), &ptr, 4, nullptr);
     WriteProcessMemory(proc, (void *)(0x4a2309 + 1), &ptr, 4, nullptr);
 
-    // [GM80] present-params 已接管(2026-08-06)：8.1 是改 runner 的 present-params 全局引用指 d3d_parameters；
-    // 8.0 的 present params 在 sub_4A1DA0/INNER_display_set_size 栈上构造（无全局可重定向）→ 改为在 CreateDevice
-    // 包装内重建干净 D3D9 布局的 pp9（原方案"改格式来源读 d3d_parameters.BackBufferFormat"用于 set_alpha_buffer，
-    // 纯 patch 版已移除 set_alpha_buffer 导出，此方案不再需要）。
-    // 注意：8.0 的 present_params（CreateDevice 包装捕获）指向 sub_4A1DA0 的栈数组，仅在 CreateDevice 期间有效
-    // （room-sizing 需要操作真实指针，见 CreateDevice）。resize_backbuffer 已不再写 present_params（见 gm82dx9.cpp）。
-    // set_alpha_buffer/set_fullscreen 当前只改 d3d_parameters（插件全局，安全但 runner 不读），待格式来源补丁后生效。
 
-    // [GM80] CheckDeviceMultiSampleType 已接管(2026-08-06)：8.0 在 sub_4A5054@0x4a50ef 调 D3D 对象槽 0x2C
-    // = CheckDeviceMultiSampleType。D3D9 比 D3D8 多第 6 参 pQualityLevels → CreateDevice hook 里把 D3D 对象
-    // vtable 槽 0x2C 改指 CheckDeviceMultiSampleType_wrap(补 &quality)。0x4a50fa 槽 0x20 = GetAdapterDisplayMode
-    // (D3D8/9 签名相同, 无需接管)。
-    // （8.1 地址段已移除）
+
+    // [GM80] CheckDeviceMultiSampleType 已接管: 0x4a50ef 调 D3D 对象槽 0x2C, CreateDevice hook 里
+    // 改指 wrap(补 &quality)。0x4a50fa 槽 0x20 = GetAdapterDisplayMode(签名相同, 无需接管)。
 
     // [GM80] CreateDevice：8.0 sub_4A1DA0 的 CreateDevice 调用（call@0x4a1f1f，槽 0x3C），
     // 整段重定向到插件 CreateDevice 包装（含 present_params 捕获 + FPU 控制字）
@@ -835,21 +832,15 @@ bool gm80_apply_patches(void) {
                  GM_WRITE((a + 1), &ptr, 4)
     PATCH(0x4a1f1d); // CreateDevice 重试调用 (sub_4A1DA0, call@0x4a1f1f)
     PATCH(0x4a1ee5); // CreateDevice 第一次尝试 (sub_4A1DA0, call@0x4a1ee7 槽 0x3C)
-    // [GM80] 2026-08-05 实机确认：第一个 CreateDevice(0x4a1ee7)在 D3D9 对象上调用槽 0x3C(非 CreateDevice,
-    // 是 GetAdapterMonitor)——返回假的成功但不创建设备(0x58d388 保持 NULL),且 __stdcall 栈错位,导致
-    // 后续 GetDeviceCaps 区崩溃(0x4a1f49 读 0)。必须与重试调用一起重定向到包装函数。
+    // [GM80] 第一个 CreateDevice(0x4a1ee7)实为槽 0x3C GetAdapterMonitor, 假成功不创建设备 → 必须一并重定向。
 #undef PATCH
 
-    // [GM80] D3DX 接管：把 sub_49A254 加载器的 DLL 名字符串（mov edx, offset "\D3DX8.dll" @0x49a27b）
-    // 改指插件字符串 "\D3DX9_43.dll"。runner 随后 LoadLibraryA("游戏目录\D3DX9_43.dll")，
-    // GetProcAddress 解析出 D3DX9 同名函数（D3DXMatrix* / D3DXCreateTexture / D3DXCheckTextureRequirements /
-    // D3DXLoadSurfaceFromMemory），存入 14 个全局 0x593868–0x59389c。这样纹理创建走 D3DX9，产出 D3D9 对象。
+    // [GM80] D3DX 接管: 把加载器 DLL 名字符串(\D3DX8.dll @0x49a27b)改指插件 \D3DX9_43.dll,
+    // runner 解析出 D3DX9 同名函数存入 14 个全局 0x593868–0x59389c, 纹理创建产出 D3D9 对象。
     ptr = (void*)d3dx9_dll_name;
     WriteProcessMemory(proc, (void *)(0x49a27b + 1), &ptr, 4, nullptr);
 
-    // [GM80] D3DX 时序兜底（2026-08-05 实机确认）：sub_49A254 在 sub_545620（先于扩展加载）运行，
-    // 字符串补丁来不及生效，加载的是原始 "\D3DX8.dll"（Win11 无此文件 → LoadLibrary 失败 → 14 个全局 NULL）。
-    // 在此直接把 14 个全局(0x593868–0x59389c)写成 D3DX9_43.dll 的导出指针（顺序与 sub_49A254 一致）。
+    // [GM80] D3DX 时序兜底: 字符串补丁来不及生效 → 直接写 14 个全局为 D3DX9_43.dll 导出指针(顺序一致)。
     {
         HMODULE d3dx9 = GetModuleHandleA("D3DX9_43.dll");
         if (!d3dx9) d3dx9 = LoadLibraryA("D3DX9_43.dll");
@@ -877,9 +868,7 @@ bool gm80_apply_patches(void) {
 
     // [GM80] wrapper 重定向（8.1 用 `E8 rel32` 替换 `mov eax,[eax]`+`call [eax+sz3]` 5字节；
     // sz6 站点用 `90 E8 rel32` 6字节等长替换。8.0 站点同样适用。）
-    // ✅ [GM80-确认] CreateVertexBuffer(0x5C)/CreateDepthStencilSurface(0x68)/SetStreamSource(0x14C)：
-    //   8.0 全模块扫描未发现这些槽位站点（8.0 原语用 DrawPrimitiveUP），8.1 的这三段补丁不适用。
-    //   深度缓冲已通过 CreateDevice pp9 的 EnableAutoDepthStencil 启用（2026-08-06）。
+    // ✅ [GM80-确认] CreateVertexBuffer/CreateDepthStencilSurface/SetStreamSource: 8.0 无这些槽位站点, 深度缓冲经 pp9 启用。
 
     // SetRenderTarget (0x7C, sz3) —— INNER_surface_set_target / INNER_surface_reset_target
 #define PATCH(a) \
@@ -930,9 +919,7 @@ bool gm80_apply_patches(void) {
     PATCH(0x4a294e); // GetBackBuffer (sub_4A286C, call@0x4a2950)
 #undef PATCH
 
-    // ✅ [GM80-确认] screen_refresh 整段重定向：8.0 的帧管线分散在
-    // INNER_screen_redraw(BeginScene)/D3D_CreateDevice(EndScene+Present)/INNER_screen_refresh(Present)，
-    // 已用槽位补丁覆盖（见下），无需 screen_refresh 包装。
+    // ✅ [GM80-确认] screen_refresh 整段重定向不需要: 帧管线已用槽位补丁覆盖(BeginScene/EndScene/Present)。
 
     // GetRenderTarget (0x80, sz6) —— INNER_surface_set_target
 #define PATCH(a) \
@@ -946,11 +933,7 @@ bool gm80_apply_patches(void) {
     // ✅ [GM80-确认] SetTexture(0, NULL)→SetNullTexture：8.0 的 SetTexture 站点已统一补到 0x104；
     // 是否区分"置 NULL"站点需要逐个确认参数，暂不启用 SetNullTexture 包装。
 
-    // ✅ [GM80-确认] white pixel 初始化：8.0 无 D3DXCreateTextureFromFileInMemoryEx 调用点（纹理走
-    // CreateTexture 直接创建），8.1 的 0x627e5a 重定向段在 8.0 不适用，可整体删除。
-    // // initialize white pixel texture
-    // ptr = ((char*)(&create_white_pixel) - (0x627e5a + 5));
-    // WriteProcessMemory(proc, (void*)(0x627e5a + 1), &ptr, 4, nullptr);
+    // ✅ [GM80-确认] white pixel 初始化: 8.0 无 D3DXCreateTextureFromFileInMemoryEx 调用点, 已删除。
 
 #define PATCH_SIMPLE(a, off) \
         offset = off;        \
@@ -959,9 +942,8 @@ bool gm80_apply_patches(void) {
         offset = off;        \
         GM_WRITE((a + 2), &offset, 2)
     // =====================================================================
-    // [GM80] D3D8→D3D9 vtable 槽位重映射（2026-08-05）
-    // 来源：py_eval 全模块扫描 + 逐点字节核对；D3D8 槽位与 8.1 一致，补丁值沿用 8.1 插件。
-    // 编码：sz6 = FF 90 disp32（写 1/2 字节于 +2）；sz3 = FF 5? disp8（写 1 字节于 +2）。
+    // [GM80] D3D8→D3D9 vtable 槽位重映射: 槽位与 8.1 一致, 补丁值沿用 8.1 插件。
+    // sz6 = FF 90 disp32(写于 +2); sz3 = FF 5? disp8(写 1 字节于 +2)。
     // =====================================================================
     // Reset (0x38→0x40, sz3)
     PATCH_SIMPLE(0x4a22ce, 0x40); // Reset (INNER_display_set_size)
@@ -1053,9 +1035,7 @@ bool gm80_apply_patches(void) {
     PATCH_SIMPLE(0x4a1b4b, 0xe4); // SetRenderState (INNER_d3d_set_culling)
     PATCH_SIMPLE(0x4a1d15, 0xe4); // SetRenderState (sub_4A1CFC 恢复渲染状态)
 
-    // SetSamplerState (0xFC→0x114, sz6)。8.0 的 0xFC 站点分两类：sampler（interp/repeat/draw 的
-    // ADDRESSU/ADDRESSV/MAGFILTER/MINFILTER）与 stage（blending 的 COLOROP 等）。sampler 站点
-    // 需同时把 state 常量从 D3DTSS_* 改成 D3DSAMP_*（数值不同：ADDRESSU 13→1 等）。
+    // SetSamplerState (0xFC→0x114, sz6): sampler 站点需同时把 state 常量 D3DTSS_* 改成 D3DSAMP_*(数值不同)。
     PATCH_DOUBLE(0x4a1b79, 0x114); // SetSamplerState (interp MAGFILTER)
     PATCH_DOUBLE(0x4a1b8d, 0x114); // SetSamplerState (interp MINFILTER)
     PATCH_DOUBLE(0x4a1ba3, 0x114); // SetSamplerState (interp MAGFILTER)
@@ -1112,13 +1092,9 @@ bool gm80_apply_patches(void) {
     PATCH_SIMPLE(0x4a27ab, 0x44); // Present (D3D_CreateDevice)
     PATCH_SIMPLE(0x4a2861, 0x44); // Present (INNER_screen_refresh)
 
-    // ✅ [GM80-确认] 8.1 的 screen_refresh 整段重定向(0x6200c2)在 8.0 不需要：8.0 的帧管线分散在
-    // INNER_screen_redraw(BeginScene)/D3D_CreateDevice(EndScene+Present)/INNER_screen_refresh(Present)，
-    // 上面已用槽位补丁覆盖。若实机出现帧同步问题再考虑加 screen_refresh 包装。
+    // ✅ [GM80-确认] 8.1 的 screen_refresh 重定向(0x6200c2)在 8.0 不需要, 帧管线已用槽位补丁覆盖。
 
-    // SetTexture (0xF4→0x104, sz6)。注：8.1 把置 NULL 的站点重定向到 SetNullTexture(白纹理)，
-    // 8.0 侧尚未区分 NULL/非 NULL 站点，暂统一补到 0x104（SetTexture 真实纹理）。
-    // [GM80-TODO] 若需还原 8.1 的 SetNullTexture 行为，需逐个确认 8.0 SetTexture 参数是否为 0。
+    // SetTexture (0xF4→0x104, sz6)。8.0 未区分 NULL/非 NULL 站点, 暂统一补到 0x104(真实纹理)。
     PATCH_DOUBLE(0x49cb89, 0x104); // SetTexture (INNER_draw_point)
     PATCH_DOUBLE(0x49cc0e, 0x104); // SetTexture (INNER_draw_point_color)
     PATCH_DOUBLE(0x49cca0, 0x104); // SetTexture (INNER_draw_line)
@@ -1207,59 +1183,24 @@ bool gm80_apply_patches(void) {
     PATCH_SIMPLE(0x4a14d1, 0x38); // UnlockRect (sub_4A12F8)
     PATCH_SIMPLE(0x4a2a95, 0x38); // UnlockRect (sub_4A286C 屏幕捕获)
 
-    // [GM80] D3DX 接管已实现(2026-08-06)：8.1 是替换 0x68fde8–0x68fdf4 函数表；8.0 是动态加载
-    // （sub_49A254 GetProcAddress 填充 0x593868–0x59389c 连续块），已在 DllMain 兜底把 14 个全局
-    // 写成 D3DX9 导出指针（顺序与 sub_49A254 一致）。以下 8.1 地址段注释保留作移植记录。
-    // // overwrite d3dx
-    // *(void **) (0x68fde8) = &D3DXGetErrorStringA;
-    // *(void **) (0x68fdec) = &D3DXCheckTextureRequirements;
-    // *(void **) (0x68fdf0) = &D3DXCreateTexture;
-    // *(void **) (0x68fdf4) = &D3DXCreateTextureFromFileInMemoryEx;
-    // #define PATCH_D3DX(a, f) \
-    //         offset = 0xb890; \
-    //         WriteProcessMemory(proc, (void*)(a), &offset, 2, nullptr); \
-    //         ptr = &f;        \
-    //         WriteProcessMemory(proc, (void*)(a+2), &ptr, 4, nullptr);
-    // PATCH_D3DX(0x53122f, D3DXCheckTextureRequirements);
-    // PATCH_D3DX(0x531241, D3DXCreateTexture);
-    // PATCH_D3DX(0x531253, D3DXCreateTextureFromFileInMemoryEx);
-    // PATCH_D3DX(0x531277, D3DXGetErrorStringA);
+    // [GM80] D3DX 接管已实现: 8.0 动态加载(sub_49A254 填 0x593868–0x59389c), 已在 DllMain 兜底。8.1 段已删。
 
 #define PATCH(addr, func) \
         ptr = (char*)(&func) - (addr + 5); \
         WriteProcessMemory(proc, (void*)(addr + 1), &ptr, 4, nullptr);
 
-    // [GM80] regain_device / last_resort 已实现(2026-08-06)：
-    //   - 设备丢失恢复 = ResetDevice 按 TestCooperativeLevel==D3DERR_DEVICENOTRESET 真 Reset
-    //     (8.0 路径: D3D_CreateDevice@0x4a2708 Present 失败 → INNER_display_set_size → Reset)
-    //   - 卸载安全 = gm80_restore_reset_hook() 在 DllMain(DLL_PROCESS_DETACH) 恢复 vtable 槽 0x40
-    // 8.1 原版裸汇编挂钩(0x620012/0x5795c5)在 8.0 不安装, 注释保留作记录。
+    // [GM80] 设备丢失恢复 = ResetDevice 真 Reset; 卸载安全 = gm80_restore_reset_hook() 恢复 vtable。
+    // 8.1 原版裸汇编挂钩(0x620012/0x5795c5)在 8.0 不安装。
 
-    // [GM80] 数学 FPU trampoline 已判定不需要(2026-08-06)：8.0 数学函数是 Delphi RTL，CreateDevice 带
-    // D3DCREATE_FPU_PRESERVE(0x22) 生效；测试工程 FPU 自检 precision=1。8.1 地址 0x633d70–0x6344b6 不适用。
-    // maths
-    // PATCH(0x633d70, sqrt_inj)
-    // PATCH(0x633e3c, exp_inj)
-    // PATCH(0x633ed4, ln_inj)
-    // PATCH(0x633f68, log2_inj)
-    // PATCH(0x634000, log10_inj)
-    // PATCH(0x634110, arcsin_inj)
-    // PATCH(0x6341a8, arccos_inj)
-    // PATCH(0x634244, arctan_inj)
-    // PATCH(0x6342ea, arctan2_inj)
-    // PATCH(0x63440e, power_inj)
-    // PATCH(0x6344b6, logn_inj)
+    // [GM80] 数学 FPU trampoline 不需要: CreateDevice 带 D3DCREATE_FPU_PRESERVE 生效, 实测 precision=1。
 	
-	// ✅ [GM80-确认] 投影矩阵 D3DX 注入不需要(2026-08-06)：该注入是给 D3DXMatrixPerspectiveLH/OrthoLH 包
-	// fldcw 恢复 FPU 控制字。8.0 FPU 已实测不受 D3D9 影响(precision=1)，无需注入。
-	// 8.1 原地址 0x68fde0/0x68fde4 不适用，注释保留作移植记录。
+	// ✅ [GM80-确认] 投影矩阵 D3DX 注入不需要: 8.0 FPU 已实测不受 D3D9 影响(precision=1)。
 
     FlushInstructionCache(proc, nullptr, 0);
 
 #if GM80_LOG
     // ===================================================================
-    // [GM80] 补丁读回验证: 抽查代表性站点, 确认内存真的被改了。
-    // 任一 MISMATCH => 该地址没写进去(越界/写保护/地址错), 需立即排查。
+    // [GM80] 补丁读回验证: 抽查代表性站点, 任一 MISMATCH => 该地址没写进去, 需立即排查。
     // ===================================================================
     gm_log("--- DllMain patch verification ---");
     int gv = 0;
