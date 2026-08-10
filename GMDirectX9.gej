@@ -37,10 +37,10 @@
 			"final": "",
 			"functions": [
 				{
-					"name": "gm82dx9_loaded",
+					"name": "gmdx9_loaded",
 					"extname": "",
 					"calltype": 12,
-					"helpline": "gm82dx9_loaded()",
+					"helpline": "gmdx9_loaded()",
 					"hidden": true,
 					"argtypes": [],
 					"returntype": 2
