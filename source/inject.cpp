@@ -5,173 +5,117 @@ extern D3DPRESENT_PARAMETERS* present_params;
 
 D3DCAPS9 d3d_caps;
 D3DPRESENT_PARAMETERS d3d_parameters = {
-        .BackBufferCount = 1,
-        .MultiSampleType = D3DMULTISAMPLE_NONE,
-        .SwapEffect = D3DSWAPEFFECT_COPY,
-        .Windowed = 1,
-        .EnableAutoDepthStencil = TRUE,
-        .AutoDepthStencilFormat = D3DFMT_D24S8,
-        .PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE,
+    .BackBufferCount = 1,
+    .MultiSampleType = D3DMULTISAMPLE_NONE,
+    .SwapEffect = D3DSWAPEFFECT_COPY,
+    .Windowed = 1,
+    .EnableAutoDepthStencil = TRUE,
+    .AutoDepthStencilFormat = D3DFMT_D24S8,
+    .PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE,
 };
 
-// ============================================================================================
-// GM80 移植说明: 本文件是 gm82dx9 注入核心(DllMain 把 runner 的 Direct3D8 换成 Direct3D9)。
-// 已完成并实测通过: vtable 槽位重映射/CreateDevice 包装/D3DCAPS 接管等, 详见 PORTING_NOTES.md。
-// ============================================================================================
-
-// [GM80] 8.0 的 D3DX 是动态 LoadLibrary，runner 的加载器(sub_49A254)用字符串 "\D3DX8.dll" 拼路径。
-// 改指这个插件字符串，runner 就会加载 D3DX9_43.dll（插件随扩展分发），GetProcAddress 解析出 D3DX9 同名函数。
+// 8.0 的 D3DX 是动态 LoadLibrary，runner 的加载器 (0x49A254) 用字符串 "\D3DX8.dll" 拼路径。
+// 改指这个插件字符串，runner 就会加载 D3DX9_43.dll（插件随扩展分发）。
 static const char d3dx9_dll_name[] = "\\D3DX9_43.dll";
 
-// [GM80] gm_log/gm_readback/GM_WRITE 已移至 gm_log.cpp/gm_log.h(2026-08-05, 对齐 GMSave 结构)
-
-HRESULT WINAPI CheckDeviceMultiSampleType(IDirect3D9 *d3d, UINT Adapter,
-                                          D3DDEVTYPE DeviceType,
-                                          D3DFORMAT SurfaceFormat,
-                                          BOOL Windowed,
-                                          D3DMULTISAMPLE_TYPE MultiSampleType) {
-    HRESULT hr = d3d->CheckDeviceMultiSampleType(Adapter, DeviceType, SurfaceFormat, Windowed, MultiSampleType, nullptr);
-#if GM80_LOG
-    gm_log("CheckDeviceMultiSampleType -> 0x%X", (unsigned)hr);
-#endif
-    return hr;
+HRESULT WINAPI CheckDeviceMultiSampleType(IDirect3D9 *d3d, UINT Adapter, 
+    D3DDEVTYPE DeviceType, D3DFORMAT SurfaceFormat, BOOL Windowed, 
+    D3DMULTISAMPLE_TYPE MultiSampleType)
+{
+    return d3d->CheckDeviceMultiSampleType(Adapter, DeviceType, SurfaceFormat,
+        Windowed, MultiSampleType, nullptr);
 }
 
-HRESULT WINAPI GetDisplayMode(IDirect3DDevice9 *dev,
-                              D3DDISPLAYMODE *pMode
-) {
-    HRESULT hr = dev->GetDisplayMode(0, pMode);
-#if GM80_LOG
-    gm_log("GetDisplayMode -> 0x%X w=%u h=%u fmt=%u",
-           (unsigned)hr, pMode ? pMode->Width : 0, pMode ? pMode->Height : 0, pMode ? pMode->Format : 0);
-#endif
-    return hr;
+HRESULT WINAPI GetDisplayMode(IDirect3DDevice9 *dev, D3DDISPLAYMODE *pMode)
+{
+    return dev->GetDisplayMode(0, pMode);
 }
 
-HRESULT WINAPI CreateImageSurface(IDirect3DDevice9 *dev,
-                                  UINT Width,
-                                  UINT Height,
-                                  D3DFORMAT Format,
-                                  IDirect3DSurface9 **ppSurface
-) {
-    HRESULT hr = dev->CreateOffscreenPlainSurface(Width, Height, Format, D3DPOOL_SCRATCH, ppSurface, nullptr);
-#if GM80_LOG
-    gm_log("CreateImageSurface %ux%u fmt=%u -> 0x%X surf=0x%p", Width, Height, Format, (unsigned)hr,
-           ppSurface ? *ppSurface : nullptr);
-#endif
-    return hr;
+HRESULT WINAPI CreateImageSurface(IDirect3DDevice9 *dev, UINT Width, UINT Height,
+    D3DFORMAT Format, IDirect3DSurface9 **ppSurface)
+{
+    return dev->CreateOffscreenPlainSurface(Width, Height, Format, D3DPOOL_SCRATCH,
+        ppSurface, nullptr);
 }
 
-HRESULT WINAPI GetBackBuffer(IDirect3DDevice9 *dev,
-                             UINT BackBuffer,
-                             D3DBACKBUFFER_TYPE Type,
-                             IDirect3DSurface9 **ppBackBuffer
-) {
-    HRESULT hr = dev->GetBackBuffer(0, BackBuffer, Type, ppBackBuffer);
-#if GM80_LOG
-    gm_log("GetBackBuffer idx=%u -> 0x%X surf=0x%p", BackBuffer, (unsigned)hr,
-           ppBackBuffer ? *ppBackBuffer : nullptr);
-#endif
-    return hr;
+HRESULT WINAPI GetBackBuffer(IDirect3DDevice9 *dev, UINT BackBuffer, 
+    D3DBACKBUFFER_TYPE Type, IDirect3DSurface9 **ppBackBuffer)
+{
+    return dev->GetBackBuffer(0, BackBuffer, Type, ppBackBuffer);
 }
 
-HRESULT WINAPI CreateVertexBuffer(IDirect3DDevice9 *dev,
-                                  UINT Length,
-                                  DWORD Usage,
-                                  DWORD FVF,
-                                  D3DPOOL Pool,
-                                  IDirect3DVertexBuffer9 **ppVertexBuffer
-) {
+HRESULT WINAPI CreateVertexBuffer(IDirect3DDevice9 *dev, UINT Length, DWORD Usage, 
+    DWORD FVF, D3DPOOL Pool, IDirect3DVertexBuffer9 **ppVertexBuffer)
+{
     return dev->CreateVertexBuffer(Length, Usage, FVF, Pool, ppVertexBuffer, nullptr);
 }
 
-HRESULT WINAPI SetStreamSource(IDirect3DDevice9 *dev,
-                               UINT StreamNumber,
-                               IDirect3DVertexBuffer9 *pStreamData,
-                               UINT Stride
-) {
+HRESULT WINAPI SetStreamSource(IDirect3DDevice9 *dev, UINT StreamNumber,
+    IDirect3DVertexBuffer9 *pStreamData, UINT Stride)
+{
     return dev->SetStreamSource(StreamNumber, pStreamData, 0, Stride);
 }
 
-HRESULT WINAPI CreateDepthStencilSurface(IDirect3DDevice9 *dev,
-                                         UINT Width,
-                                         UINT Height,
-                                         D3DFORMAT Format,
-                                         D3DMULTISAMPLE_TYPE MultiSample,
-                                         IDirect3DSurface9 **ppSurface
-) {
-    return dev->CreateDepthStencilSurface(Width, Height, Format, MultiSample, 0, FALSE, ppSurface, nullptr);
+HRESULT WINAPI CreateDepthStencilSurface(IDirect3DDevice9 *dev, UINT Width, UINT Height,
+    D3DFORMAT Format, D3DMULTISAMPLE_TYPE MultiSample, IDirect3DSurface9 **ppSurface)
+{
+    return dev->CreateDepthStencilSurface(Width, Height, Format, MultiSample, 0, FALSE, 
+        ppSurface, nullptr);
 }
 
-HRESULT
-WINAPI SetRenderTarget(IDirect3DDevice9 *dev, IDirect3DSurface9 *pRenderTarget, IDirect3DSurface9 *pNewZStencil) {
+HRESULT WINAPI SetRenderTarget(IDirect3DDevice9 *dev, IDirect3DSurface9 *pRenderTarget, 
+    IDirect3DSurface9 *pNewZStencil)
+{
     HRESULT hr = dev->SetRenderTarget(0, pRenderTarget);
     if (SUCCEEDED(hr)) hr = dev->SetDepthStencilSurface(pNewZStencil);
-#if GM80_LOG
-    gm_log("SetRenderTarget -> 0x%X rt=0x%p zs=0x%p", (unsigned)hr, pRenderTarget, pNewZStencil);
-#endif
     return hr;
 }
 
-HRESULT WINAPI GetRenderTarget(IDirect3DDevice9 *dev, IDirect3DSurface9 **ppRenderTarget) {
-    HRESULT hr = dev->GetRenderTarget(0, ppRenderTarget);
-#if GM80_LOG
-    gm_log("GetRenderTarget -> 0x%X rt=0x%p", (unsigned)hr, ppRenderTarget ? *ppRenderTarget : nullptr);
-#endif
-    return hr;
+HRESULT WINAPI GetRenderTarget(IDirect3DDevice9 *dev, IDirect3DSurface9 **ppRenderTarget)
+{
+    return dev->GetRenderTarget(0, ppRenderTarget);
 }
 
-HRESULT WINAPI CopyRects(IDirect3DDevice9 *dev,
-                         IDirect3DSurface9 *pSourceSurface,
-                         CONST RECT *pSourceRectsArray,
-                         UINT cRects,
-                         IDirect3DSurface9 *pDestinationSurface,
-                         CONST POINT *pDestPointsArray
-) {
+HRESULT WINAPI CopyRects(IDirect3DDevice9 *dev, IDirect3DSurface9 *pSourceSurface,
+    CONST RECT *pSourceRectsArray, UINT cRects, IDirect3DSurface9 *pDestinationSurface,
+    CONST POINT *pDestPointsArray)
+{
     RECT destRect;
     destRect.left = pDestPointsArray->x;
     destRect.top = pDestPointsArray->y;
     destRect.right = destRect.left + (pSourceRectsArray->right - pSourceRectsArray->left);
     destRect.bottom = destRect.top + (pSourceRectsArray->bottom - pSourceRectsArray->top);
-    // [GM80] AddDirtyRect 不需要: D3D9 表面无法反向取父纹理, 目标多为 default-pool 表面, 正确性无碍。
-    HRESULT hr = D3DXLoadSurfaceFromSurface(pDestinationSurface, nullptr, &destRect, pSourceSurface, nullptr,
-                                            pSourceRectsArray, D3DX_FILTER_NONE, 0);
-#if GM80_LOG
-    gm_log("CopyRects %dx%d src=0x%p dst=0x%p -> 0x%X",
-           destRect.right - destRect.left, destRect.bottom - destRect.top,
-           pSourceSurface, pDestinationSurface, (unsigned)hr);
-#endif
+    // AddDirtyRect 不需要: D3D9 表面无法反向取父纹理, 目标多为 default-pool 表面, 正确性无碍。
+    HRESULT hr = D3DXLoadSurfaceFromSurface(pDestinationSurface, nullptr, &destRect, 
+        pSourceSurface, nullptr, pSourceRectsArray, D3DX_FILTER_NONE, 0);
     return hr;
 }
 
-HRESULT WINAPI
-D3DXGetErrorStringA(
-        HRESULT hr,
-        LPSTR pBuffer,
-        UINT BufferLen) {
+HRESULT WINAPI D3DXGetErrorStringA(HRESULT hr, LPSTR pBuffer, UINT BufferLen)
+{
     const wchar_t *wstr = DXGetErrorStringW(hr);
     WideCharToMultiByte(CP_ACP, 0, wstr, -1, pBuffer, BufferLen, nullptr, nullptr);
     return S_OK;
 }
 
-HRESULT WINAPI screen_refresh(IDirect3DDevice9 *dev, const RECT *pSourceRect, const RECT *pDestRect, HWND hDestOverride, const RGNDATA *pDirtyRegion) {
+HRESULT WINAPI screen_refresh(IDirect3DDevice9 *dev, const RECT *pSourceRect, 
+    const RECT *pDestRect, HWND hDestOverride, const RGNDATA *pDirtyRegion)
+{
     dev->EndScene();
     auto res = dev->Present(pSourceRect, pDestRect, hDestOverride, pDirtyRegion);
     dev->BeginScene();
-#if GM80_LOG
-    gm_log("screen_refresh Present -> 0x%X", (unsigned)res);
-#endif
     return res;
 }
 
-void WINAPI regain_device() {
+void WINAPI regain_device()
+{
     // force exclusive fullscreen off
     d3d_parameters.Windowed = TRUE;
     d3d_parameters.FullScreen_RefreshRateInHz = 0;
     (*runner_display_reset)();
 }
 
-// [GM80] SetVertexShader 包装: runner 每绘制 SetVertexShader(FVF)。有自定义 VS(GMGraphic)时
+// SetVertexShader 包装: runner 每绘制 SetVertexShader(FVF)。有自定义 VS(GMGraphic)时
 // FVF 重置翻译成 SetVertexDeclaration 保持 VS 绑定, 否则透传 SetFVF。不记日志(每帧数千次)。
 
 // 引擎三种 FVF 顶点布局: shape 16B(pos+color) / 2d 24B(+uv) / 3d 36B(pos+normal+color+uv)。
@@ -206,7 +150,7 @@ static HRESULT gm80_ensure_decl(IDirect3DDevice9* dev, IDirect3DVertexDeclaratio
     return S_OK;
 }
 
-// [GM80] 仿固定管线 VS: ps_3_0 的输入(v0/v1)只能由 VS 喂, 故自定义 PS 已绑而无 VS 时绑定,
+// 仿固定管线 VS: ps_3_0 的输入(v0/v1)只能由 VS 喂, 故自定义 PS 已绑而无 VS 时绑定,
 // 做 FFP 等价 pos*WVP + 透传 color/uv。uWVP 行主序 → 写 mul(uWVP,pos); 编成 vs_3_0 见 PORTING_NOTES。
 static IDirect3DVertexShader9* gm80_fake_ffp_vs = nullptr;
 static const char gm80_fake_ffp_hlsl[] =
@@ -266,6 +210,22 @@ static HRESULT gm80_bind_fake_ffp(IDirect3DDevice9* dev, DWORD fvf) {
     return dev->SetVertexDeclaration(*pdecl);
 }
 
+// [GM80-2026-08-09] GMGraphic 透传 VS 识别: 跨 DLL 取 GMGraphic.dll 的 get_passthrough_vs 导出。
+// 引擎绘制(如 draw_background 到 surface)时设备上可能绑着 GMGraphic 的透传 VS(ps-only shader 场景),
+// 它的 WVP(c0-c3)固化在 shader_set 绑定时刻 → surface_set_target 重设引擎投影后失真(左上角 sliver)。
+// 这里让 SetVertexShader 钩子也识别它, 每次引擎绘制前刷新 WVP 到当前投影。两套透传 VS 共用
+// c0-c3 + mul(uWVP,pos) 约定, 刷新函数可直接复用 gm80_update_fake_ffp_wvp。
+typedef IDirect3DVertexShader9* (__cdecl *GMG_GET_PASSTHROUGH_VS)();
+static IDirect3DVertexShader9* gmg_get_passthrough_vs() {
+    static GMG_GET_PASSTHROUGH_VS fn = nullptr;
+    if (!fn) {
+        HMODULE h = GetModuleHandleA("GMGraphic.dll");
+        if (h) fn = (GMG_GET_PASSTHROUGH_VS)GetProcAddress(h, "get_passthrough_vs");
+        if (!fn) return nullptr;
+    }
+    return fn();  // 每次取最新: 透传 VS 懒创建, 首次 shader_set ps-only 才非空
+}
+
 HRESULT WINAPI SetVertexShader(IDirect3DDevice9 *dev, DWORD fvf) {
     IDirect3DVertexShader9* vs = nullptr;
     if (SUCCEEDED(dev->GetVertexShader(&vs)) && vs != nullptr) {
@@ -288,13 +248,15 @@ HRESULT WINAPI SetVertexShader(IDirect3DDevice9 *dev, DWORD fvf) {
         if (FAILED(hr)) return hr;
         // [2026-08-08] 若当前 VS 是本钩子绑的仿固定管线 VS(ps-only 场景), 每绘制刷一次 WVP
         // (投影可能已变, 如换视图/d3d_set_projection)。用户自定义 VS 不在此列(其常量自管)。
-        if (vs == gm80_fake_ffp_vs) {
+        // [2026-08-09] 同样识别 GMGraphic 的透传 VS: 引擎绘制时设备上可能是它绑的(ps-only shader),
+        // WVP 需在引擎 SetVertexShader 时刻刷新到当前投影(surface_set_target 重设后)。
+        if (vs == gm80_fake_ffp_vs || vs == gmg_get_passthrough_vs()) {
             hr = gm80_update_fake_ffp_wvp(dev);
             if (FAILED(hr)) return hr;
         }
         return dev->SetVertexDeclaration(decl);
     }
-    // [GM80] 仿固定管线 VS 兜底: 无自定义 VS 但自定义 PS 激活(ps-only)时绑定喂 v0/v1;
+    // 仿固定管线 VS 兜底: 无自定义 VS 但自定义 PS 激活(ps-only)时绑定喂 v0/v1;
     // 实测 ps_3_0 仍全透明 → GMGraphic 已回退 ps_2_0, 本分支留作 vs_3_0 透传 VS 实验。
     IDirect3DPixelShader9* ps = nullptr;
     if (SUCCEEDED(dev->GetPixelShader(&ps)) && ps != nullptr) {
@@ -303,7 +265,7 @@ HRESULT WINAPI SetVertexShader(IDirect3DDevice9 *dev, DWORD fvf) {
     return dev->SetFVF(fvf);
 }
 
-// [GM80] SetViewport 接管: D3D9 viewport 超出 render target 只裁剪不收缩 → 表面渲染只捕左上角。
+// SetViewport 接管: D3D9 viewport 超出 render target 只裁剪不收缩 → 表面渲染只捕左上角。
 // 把 D3D_SetViewport 调用点(0x4a2432)重定向到本函数, 钳到当前 render target 尺寸。
 HRESULT WINAPI SetViewport_inj(IDirect3DDevice9 *dev, D3DVIEWPORT9 *vp) {
     IDirect3DSurface9 *rt = nullptr;
@@ -329,13 +291,13 @@ HRESULT WINAPI SetViewport_inj(IDirect3DDevice9 *dev, D3DVIEWPORT9 *vp) {
 short old_cw = 0;
 short new_cw = 0;
 
-// [GM80] Reset 接管: 8.0 runner 传 D3D8 布局 present params 给 Reset → D3D9 字段错位必失败。
+// Reset 接管: 8.0 runner 传 D3D8 布局 present params 给 Reset → D3D9 字段错位必失败。
 // CreateDevice 成功后把 vtable 槽 0x40 改指 ResetDevice 包装, 用创建时的干净 pp9 副本调真 Reset。
 static D3DPRESENT_PARAMETERS g_pp9;   // 设备创建时的 pp9 副本(与 CreateDevice 完全一致 → Reset 必成功)
 static HWND g_window = nullptr;       // CreateDevice 传入的有效窗口
 static HRESULT (WINAPI* real_reset)(IDirect3DDevice9*, D3DPRESENT_PARAMETERS*) = nullptr;  // 原始 D3D9 Reset
 
-// [GM80] CheckDeviceMultiSampleType 接管: D3D9 比 D3D8 多第 6 参 pQualityLevels, 8.0 只传 5 参
+// CheckDeviceMultiSampleType 接管: D3D9 比 D3D8 多第 6 参 pQualityLevels, 8.0 只传 5 参
 // → D3D9 写栈垃圾。D3D 对象 vtable 槽 0x2C → 包装(补 &quality)。
 static HRESULT (WINAPI* real_check_ms)(IDirect3D9*, UINT, D3DDEVTYPE, D3DFORMAT, BOOL, D3DMULTISAMPLE_TYPE, DWORD*) = nullptr;
 
@@ -348,7 +310,7 @@ HRESULT WINAPI CheckDeviceMultiSampleType_wrap(IDirect3D9 *d3d9, UINT Adapter, D
 }
 
 HRESULT WINAPI ResetDevice(IDirect3DDevice9 *dev, D3DPRESENT_PARAMETERS *pParams) {
-    // [GM80] 设备丢失恢复: Present 失败 → INNER_display_set_size → Reset。TestCooperativeLevel 判定:
+    // 设备丢失恢复: Present 失败 → INNER_display_set_size → Reset。TestCooperativeLevel 判定:
     // NOTRESET=真 Reset(必成功, g_pp9 与 CreateDevice 一致); S_OK/LOST=no-op(避免每帧真 Reset 黑屏)。
     (void)pParams;
     HRESULT tcl = dev->TestCooperativeLevel();
@@ -362,7 +324,7 @@ HRESULT WINAPI ResetDevice(IDirect3DDevice9 *dev, D3DPRESENT_PARAMETERS *pParams
     return S_OK;
 }
 
-// [GM80] DLL 卸载安全: DLL 卸载而设备仍活着时, runner 再调 Reset 会跳未映射内存。
+// DLL 卸载安全: DLL 卸载而设备仍活着时, runner 再调 Reset 会跳未映射内存。
 // DllMain(DETACH) 恢复 vtable 槽 0x40(仅当仍是我们的钩子), __try/__except 兜底设备已释放。
 void gm80_restore_reset_hook(void) {
     __try {
@@ -411,7 +373,7 @@ HRESULT WINAPI CreateDevice(IDirect3D9 *d3d9, UINT Adapter, D3DDEVTYPE DeviceTyp
     }
 #endif
 
-	// [GM80] 分辨率可调修复: 保持 runner 传入的 backbuffer 尺寸(显示器), 不缩到首个房间视图
+	// 分辨率可调修复: 保持 runner 传入的 backbuffer 尺寸(显示器), 不缩到首个房间视图
 	// (8.0 换分辨率不调 Reset, backbuffer 恒不变; 缩了会被夹住, 可见区永远卡在初始尺寸)。
 
 #if GM80_LOG
@@ -427,7 +389,7 @@ HRESULT WINAPI CreateDevice(IDirect3D9 *d3d9, UINT Adapter, D3DDEVTYPE DeviceTyp
     }
 #endif
     
-    // [GM80] runner 栈上构造 D3D8 布局 present params → D3D9 字段错位。只采用开头 4 字段(布局一致), 其余干净重建 pp9。
+    // runner 栈上构造 D3D8 布局 present params → D3D9 字段错位。只采用开头 4 字段(布局一致), 其余干净重建 pp9。
     D3DPRESENT_PARAMETERS pp9;
     memset(&pp9, 0, sizeof(pp9));
     if (present_params) {
@@ -438,11 +400,11 @@ HRESULT WINAPI CreateDevice(IDirect3D9 *d3d9, UINT Adapter, D3DDEVTYPE DeviceTyp
     }
     pp9.SwapEffect = D3DSWAPEFFECT_COPY;
     pp9.hDeviceWindow = hFocusWindow;   // 不读 runner 的字段(错位垃圾); 焦点窗口已验证有效
-    // [GM80] GM8 只支持无边框全屏(2026-08-06 确认): "全屏"= runner 把窗口放大到显示尺寸,
+    // GM8 只支持无边框全屏(2026-08-06 确认): "全屏"= runner 把窗口放大到显示尺寸,
     // 设备始终 windowed, Present 自动拉伸到窗口。绝不能设 Windowed=FALSE(D3D9 独占全屏 ≠ GM8 行为)。
     pp9.Windowed = TRUE;
     pp9.PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
-    // [GM80] 深度缓冲(2026-08-06, 对齐 gm82dx9 d3d_parameters): 启用 auto-depth-stencil,
+    // 深度缓冲(2026-08-06, 对齐 gm82dx9 d3d_parameters): 启用 auto-depth-stencil,
     // 3D 游戏的 d3d_set_hidden(z-test)/d3d_clear_depth 依赖它。D24S8 不支持则回退 D16。
     pp9.EnableAutoDepthStencil = TRUE;
     pp9.AutoDepthStencilFormat = D3DFMT_D24S8;
@@ -463,7 +425,7 @@ HRESULT WINAPI CreateDevice(IDirect3D9 *d3d9, UINT Adapter, D3DDEVTYPE DeviceTyp
                hFocusWindow ? IsWindow((HWND)hFocusWindow) : -1);
     }
 #endif
-    // [GM80] 硬件 VP: 把 runner 的 0x22(SWVP|FPU_PRESERVE) 换成 0x42(HWVP), 失败则回退原始 flags。
+    // 硬件 VP: 把 runner 的 0x22(SWVP|FPU_PRESERVE) 换成 0x42(HWVP), 失败则回退原始 flags。
     DWORD bf_orig = BehaviorFlags;
     DWORD bf_hw = (bf_orig & ~D3DCREATE_SOFTWARE_VERTEXPROCESSING) | D3DCREATE_HARDWARE_VERTEXPROCESSING;
     DWORD bf_used = bf_hw;
@@ -476,7 +438,7 @@ HRESULT WINAPI CreateDevice(IDirect3D9 *d3d9, UINT Adapter, D3DDEVTYPE DeviceTyp
         res = d3d9->CreateDevice(Adapter, DeviceType, hFocusWindow, bf_orig, &pp9, ppReturnedDeviceInterface);
         bf_used = SUCCEEDED(res) ? bf_orig : bf_hw;
     }
-    // [GM80] 全屏失败(D3DERR_NOTAVAILABLE 常见于基本显示适配器/远程桌面不支持全屏) → 回退窗口模式
+    // 全屏失败(D3DERR_NOTAVAILABLE 常见于基本显示适配器/远程桌面不支持全屏) → 回退窗口模式
     if (FAILED(res) && !pp9.Windowed) {
         gm_log("  fullscreen CreateDevice failed 0x%X -> retry windowed", (unsigned)res);
         pp9.Windowed = TRUE;
@@ -490,7 +452,7 @@ HRESULT WINAPI CreateDevice(IDirect3D9 *d3d9, UINT Adapter, D3DDEVTYPE DeviceTyp
            pp9.Windowed);
 #endif
 
-    // [GM80] Reset 接管(2026-08-05): 设备创建成功后把 vtable 槽 0x40(Reset)重定向到 ResetDevice 包装。
+    // Reset 接管(2026-08-05): 设备创建成功后把 vtable 槽 0x40(Reset)重定向到 ResetDevice 包装。
     // 8.0 runner 的 Reset 调用(传 D3D8 布局 present params)经此包装用创建时的干净 pp9 调真实 Reset。
     if (SUCCEEDED(res) && ppReturnedDeviceInterface && *ppReturnedDeviceInterface) {
         g_window = hFocusWindow;
@@ -508,7 +470,7 @@ HRESULT WINAPI CreateDevice(IDirect3D9 *d3d9, UINT Adapter, D3DDEVTYPE DeviceTyp
                 gm_log("  vtable[0x40] hook FAILED (VirtualProtect err=%lu)", GetLastError());
             }
         }
-        // [GM80] CheckDeviceMultiSampleType 接管: D3D 对象 vtable 槽 0x2C → 包装(补 pQualityLevels)。
+        // CheckDeviceMultiSampleType 接管: D3D 对象 vtable 槽 0x2C → 包装(补 pQualityLevels)。
         if (!real_check_ms) {
             void **d3d9_vt = *(void ***)d3d9;
             real_check_ms = (HRESULT (WINAPI*)(IDirect3D9*, UINT, D3DDEVTYPE, D3DFORMAT, BOOL, D3DMULTISAMPLE_TYPE, DWORD*))d3d9_vt[11]; // 槽 0x2C/4 = 11
@@ -741,7 +703,7 @@ const uint8_t reset_patch[] = {
         0xc3,
 };
 
-// [GM80] HINSTANCE my_handle 定义已移至根目录 dllmain.cpp(声明在 gm82dx9.h)
+// HINSTANCE my_handle 定义已移至根目录 dllmain.cpp(声明在 gm82dx9.h)
 
 // 8.1 原版裸汇编卸载挂钩(0x5795c5), 8.0 不安装(死代码); 卸载安全由 DllMain DETACH 的
 // gm80_restore_reset_hook() 实现。体内 8.1 地址在 8.0 上不能用, 置空。
@@ -772,7 +734,7 @@ __declspec(naked) void last_resort() {
     }
 }
 
-// [GM80] DllMain 已移至根目录 dllmain.cpp(结构对齐 GMSave)。此处是补丁主体,
+// DllMain 已移至根目录 dllmain.cpp(结构对齐 GMSave)。此处是补丁主体,
 // 由 dllmain.cpp 的 DllMain 在 DLL_PROCESS_ATTACH 时调用。
 bool gm80_apply_patches(void) {
 
@@ -788,31 +750,31 @@ bool gm80_apply_patches(void) {
 #endif
 
     // =========================================================================================
-    // [GM80] DllMain 补丁入口。下方地址已重映射到 8.0, 注释禁用的 8.1 段落为移植记录不会误写。
+    // DllMain 补丁入口。下方地址已重映射到 8.0, 注释禁用的 8.1 段落为移植记录不会误写。
     // =========================================================================================
     HANDLE proc = GetCurrentProcess();
 
     void *ptr;
     uint16_t offset;
 
-    // [GM80] SDK 版本: 0x4a1e13 push 0x20(32)。必须 5 字节 `68 20 00 00 00` 与原 push 同长;
+    // SDK 版本: 0x4a1e13 push 0x20(32)。必须 5 字节 `68 20 00 00 00` 与原 push 同长;
     // 2 字节 `6A 20` 会留下 3 字节被解码成 `add [eax],al` → 写 0x20 崩溃(实机复现)。
     {
         uint8_t push32[] = {0x68, 0x20, 0x00, 0x00, 0x00};
         WriteProcessMemory(proc, (void *)(0x4a1e13), push32, 5, nullptr);
     }
 
-    // [GM80] Direct3DCreate8→9：8.0 的 D3DCreate@0x484df4 内 `call sub_484DEC`(导入thunk) @0x484dff，
+    // Direct3DCreate8→9：8.0 的 D3DCreate@0x484df4 内 `call sub_484DEC`(导入thunk) @0x484dff，
     // 把 rel32 改指 Direct3DCreate9（基址 0x400000，0x484dff+5=0x484e04）
     {
         ptr = (char *)(&Direct3DCreate9) - (0x484e04);
         WriteProcessMemory(proc, (void *)(0x484e00), &ptr, 4, nullptr);
     }
 
-    // [GM80] present-params 已接管: 8.0 的 present params 在栈上构造(无全局可重定向) → CreateDevice
+    // present-params 已接管: 8.0 的 present params 在栈上构造(无全局可重定向) → CreateDevice
     // 包装内重建干净 D3D9 pp9。以下 8.1 地址段不可用, 已删除。
 
-    // [GM80] D3DCAPS 接管: D3DCAPS9 比 D3DCAPS8 大, runner 的 caps 缓冲会溢出 → 改指插件 d3d_caps。
+    // D3DCAPS 接管: D3DCAPS9 比 D3DCAPS8 大, runner 的 caps 缓冲会溢出 → 改指插件 d3d_caps。
     // 两个 push offset unk_6C7244 站点: 0x4a1f3e、0x4a2309。
     ptr = &d3d_caps;
     WriteProcessMemory(proc, (void *)(0x4a1f3e + 1), &ptr, 4, nullptr);
@@ -820,10 +782,10 @@ bool gm80_apply_patches(void) {
 
 
 
-    // [GM80] CheckDeviceMultiSampleType 已接管: 0x4a50ef 调 D3D 对象槽 0x2C, CreateDevice hook 里
+    // CheckDeviceMultiSampleType 已接管: 0x4a50ef 调 D3D 对象槽 0x2C, CreateDevice hook 里
     // 改指 wrap(补 &quality)。0x4a50fa 槽 0x20 = GetAdapterDisplayMode(签名相同, 无需接管)。
 
-    // [GM80] CreateDevice：8.0 sub_4A1DA0 的 CreateDevice 调用（call@0x4a1f1f，槽 0x3C），
+    // CreateDevice：8.0 sub_4A1DA0 的 CreateDevice 调用（call@0x4a1f1f，槽 0x3C），
     // 整段重定向到插件 CreateDevice 包装（含 present_params 捕获 + FPU 控制字）
 #define PATCH(a) \
                  offset = 0xe8; \
@@ -832,15 +794,15 @@ bool gm80_apply_patches(void) {
                  GM_WRITE((a + 1), &ptr, 4)
     PATCH(0x4a1f1d); // CreateDevice 重试调用 (sub_4A1DA0, call@0x4a1f1f)
     PATCH(0x4a1ee5); // CreateDevice 第一次尝试 (sub_4A1DA0, call@0x4a1ee7 槽 0x3C)
-    // [GM80] 第一个 CreateDevice(0x4a1ee7)实为槽 0x3C GetAdapterMonitor, 假成功不创建设备 → 必须一并重定向。
+    // 第一个 CreateDevice(0x4a1ee7)实为槽 0x3C GetAdapterMonitor, 假成功不创建设备 → 必须一并重定向。
 #undef PATCH
 
-    // [GM80] D3DX 接管: 把加载器 DLL 名字符串(\D3DX8.dll @0x49a27b)改指插件 \D3DX9_43.dll,
+    // D3DX 接管: 把加载器 DLL 名字符串(\D3DX8.dll @0x49a27b)改指插件 \D3DX9_43.dll,
     // runner 解析出 D3DX9 同名函数存入 14 个全局 0x593868–0x59389c, 纹理创建产出 D3D9 对象。
     ptr = (void*)d3dx9_dll_name;
     WriteProcessMemory(proc, (void *)(0x49a27b + 1), &ptr, 4, nullptr);
 
-    // [GM80] D3DX 时序兜底: 字符串补丁来不及生效 → 直接写 14 个全局为 D3DX9_43.dll 导出指针(顺序一致)。
+    // D3DX 时序兜底: 字符串补丁来不及生效 → 直接写 14 个全局为 D3DX9_43.dll 导出指针(顺序一致)。
     {
         HMODULE d3dx9 = GetModuleHandleA("D3DX9_43.dll");
         if (!d3dx9) d3dx9 = LoadLibraryA("D3DX9_43.dll");
@@ -856,19 +818,11 @@ bool gm80_apply_patches(void) {
             void *fn = d3dx9 ? (void*)GetProcAddress(d3dx9, d3dx9_names[i]) : nullptr;
             WriteProcessMemory(proc, (void*)(0x593868 + i * 4), &fn, 4, nullptr);
         }
-#if GM80_LOG
-        {
-            unsigned bmp = 0;
-            for (int i = 0; i < 14; i++) if (dx[i]) bmp |= (1u << i);
-            gm_log("  D3DX globals fallback: d3dx9_43=%s bitmap=0x%X",
-                   d3dx9 ? "loaded" : "NOT LOADED", bmp);
-        }
-#endif
     }
 
-    // [GM80] wrapper 重定向（8.1 用 `E8 rel32` 替换 `mov eax,[eax]`+`call [eax+sz3]` 5字节；
+    // wrapper 重定向（8.1 用 `E8 rel32` 替换 `mov eax,[eax]`+`call [eax+sz3]` 5字节；
     // sz6 站点用 `90 E8 rel32` 6字节等长替换。8.0 站点同样适用。）
-    // ✅ [GM80-确认] CreateVertexBuffer/CreateDepthStencilSurface/SetStreamSource: 8.0 无这些槽位站点, 深度缓冲经 pp9 启用。
+    // CreateVertexBuffer/CreateDepthStencilSurface/SetStreamSource: 8.0 无这些槽位站点, 深度缓冲经 pp9 启用。
 
     // SetRenderTarget (0x7C, sz3) —— INNER_surface_set_target / INNER_surface_reset_target
 #define PATCH(a) \
@@ -919,7 +873,7 @@ bool gm80_apply_patches(void) {
     PATCH(0x4a294e); // GetBackBuffer (sub_4A286C, call@0x4a2950)
 #undef PATCH
 
-    // ✅ [GM80-确认] screen_refresh 整段重定向不需要: 帧管线已用槽位补丁覆盖(BeginScene/EndScene/Present)。
+    // screen_refresh 整段重定向不需要: 帧管线已用槽位补丁覆盖(BeginScene/EndScene/Present)。
 
     // GetRenderTarget (0x80, sz6) —— INNER_surface_set_target
 #define PATCH(a) \
@@ -930,10 +884,10 @@ bool gm80_apply_patches(void) {
     PATCH(0x4a0eb7); // GetRenderTarget (INNER_surface_set_target)
 #undef PATCH
 
-    // ✅ [GM80-确认] SetTexture(0, NULL)→SetNullTexture：8.0 的 SetTexture 站点已统一补到 0x104；
+    // SetTexture(0, NULL)→SetNullTexture：8.0 的 SetTexture 站点已统一补到 0x104；
     // 是否区分"置 NULL"站点需要逐个确认参数，暂不启用 SetNullTexture 包装。
 
-    // ✅ [GM80-确认] white pixel 初始化: 8.0 无 D3DXCreateTextureFromFileInMemoryEx 调用点, 已删除。
+    // white pixel 初始化: 8.0 无 D3DXCreateTextureFromFileInMemoryEx 调用点, 已删除。
 
 #define PATCH_SIMPLE(a, off) \
         offset = off;        \
@@ -942,7 +896,7 @@ bool gm80_apply_patches(void) {
         offset = off;        \
         GM_WRITE((a + 2), &offset, 2)
     // =====================================================================
-    // [GM80] D3D8→D3D9 vtable 槽位重映射: 槽位与 8.1 一致, 补丁值沿用 8.1 插件。
+    // D3D8→D3D9 vtable 槽位重映射: 槽位与 8.1 一致, 补丁值沿用 8.1 插件。
     // sz6 = FF 90 disp32(写于 +2); sz3 = FF 5? disp8(写 1 字节于 +2)。
     // =====================================================================
     // Reset (0x38→0x40, sz3)
@@ -966,7 +920,7 @@ bool gm80_apply_patches(void) {
     PATCH(0x4a2432); // SetViewport (D3D_SetViewport)
 #undef PATCH
 
-    // ✅ [GM80-确认] SetMaterial：8.0 扫描未发现 0xA8 站点（8.1 有 0x56475e→0xc4），无需补丁。
+    // SetMaterial：8.0 扫描未发现 0xA8 站点（8.1 有 0x56475e→0xc4），无需补丁。
 
     // SetLight (0xB0→0xCC, sz6) / LightEnable (0xB8→0xD4, sz6)
     PATCH_SIMPLE(0x49f3eb, 0xcc); // SetLight
@@ -1053,7 +1007,7 @@ bool gm80_apply_patches(void) {
     PATCH_DOUBLE(0x4a46a4, 0x114); // SetSamplerState (ADDRESSU)
     PATCH_DOUBLE(0x4a46ba, 0x114); // SetSamplerState (ADDRESSV)
 
-    // [GM80] sampler state 常量：D3DTSS_ADDRESSU(0x0D)→D3DSAMP_ADDRESSU(1)、ADDRESSV(0x0E)→2、
+    // sampler state 常量：D3DTSS_ADDRESSU(0x0D)→D3DSAMP_ADDRESSU(1)、ADDRESSV(0x0E)→2、
     // MAGFILTER(0x10)→5、MINFILTER(0x11)→6（写 push imm8 的 +1 字节）
     offset = D3DSAMP_MAGFILTER;
     WriteProcessMemory(proc, (void *) (0x4a1b6d + 1), &offset, 1, nullptr);
@@ -1092,7 +1046,7 @@ bool gm80_apply_patches(void) {
     PATCH_SIMPLE(0x4a27ab, 0x44); // Present (D3D_CreateDevice)
     PATCH_SIMPLE(0x4a2861, 0x44); // Present (INNER_screen_refresh)
 
-    // ✅ [GM80-确认] 8.1 的 screen_refresh 重定向(0x6200c2)在 8.0 不需要, 帧管线已用槽位补丁覆盖。
+    // 8.1 的 screen_refresh 重定向(0x6200c2)在 8.0 不需要, 帧管线已用槽位补丁覆盖。
 
     // SetTexture (0xF4→0x104, sz6)。8.0 未区分 NULL/非 NULL 站点, 暂统一补到 0x104(真实纹理)。
     PATCH_DOUBLE(0x49cb89, 0x104); // SetTexture (INNER_draw_point)
@@ -1114,7 +1068,7 @@ bool gm80_apply_patches(void) {
     PATCH_DOUBLE(0x4a39de, 0x104); // SetTexture (DrawTexture)
     PATCH_DOUBLE(0x4a46d9, 0x104); // SetTexture
 
-    // ✅ [GM80-确认] DrawPrimitive(0x118→0x144)：8.0 全模块扫描未发现 0x118 站点（8.1 有 0x568b87 等 3 处），
+    // DrawPrimitive(0x118→0x144)：8.0 全模块扫描未发现 0x118 站点（8.1 有 0x568b87 等 3 处），
     // 8.0 只用 DrawPrimitiveUP(0x120)，无需补 DrawPrimitive。
 
     // DrawPrimitiveUP (0x120→0x14C, sz6)
@@ -1173,7 +1127,7 @@ bool gm80_apply_patches(void) {
     PATCH_SIMPLE(0x4a316f, 0x48); // GetSurfaceLevel (sub_4A3124)
     PATCH_SIMPLE(0x4a35ed, 0x48); // GetSurfaceLevel (sub_4A35BC)
 
-    // ✅ [GM80-确认] GetDepthStencilSurface(0x84→0xa0)：8.0 全模块扫描未发现 0x84 站点（8.1 有 0x56b741）。
+    // GetDepthStencilSurface(0x84→0xa0)：8.0 全模块扫描未发现 0x84 站点（8.1 有 0x56b741）。
     // 8.0 深度缓冲经 off_58FC14 间接指针创建，无独立 GetDepthStencilSurface 调用，暂无需补丁。
 
     // LockRect (0x24→0x34, sz3) / UnlockRect (0x28→0x38, sz3)
@@ -1183,48 +1137,20 @@ bool gm80_apply_patches(void) {
     PATCH_SIMPLE(0x4a14d1, 0x38); // UnlockRect (sub_4A12F8)
     PATCH_SIMPLE(0x4a2a95, 0x38); // UnlockRect (sub_4A286C 屏幕捕获)
 
-    // [GM80] D3DX 接管已实现: 8.0 动态加载(sub_49A254 填 0x593868–0x59389c), 已在 DllMain 兜底。8.1 段已删。
+    // D3DX 接管已实现: 8.0 动态加载(sub_49A254 填 0x593868–0x59389c), 已在 DllMain 兜底。8.1 段已删。
 
 #define PATCH(addr, func) \
         ptr = (char*)(&func) - (addr + 5); \
         WriteProcessMemory(proc, (void*)(addr + 1), &ptr, 4, nullptr);
 
-    // [GM80] 设备丢失恢复 = ResetDevice 真 Reset; 卸载安全 = gm80_restore_reset_hook() 恢复 vtable。
+    // 设备丢失恢复 = ResetDevice 真 Reset; 卸载安全 = gm80_restore_reset_hook() 恢复 vtable。
     // 8.1 原版裸汇编挂钩(0x620012/0x5795c5)在 8.0 不安装。
 
-    // [GM80] 数学 FPU trampoline 不需要: CreateDevice 带 D3DCREATE_FPU_PRESERVE 生效, 实测 precision=1。
+    // 数学 FPU trampoline 不需要: CreateDevice 带 D3DCREATE_FPU_PRESERVE 生效, 实测 precision=1。
 	
-	// ✅ [GM80-确认] 投影矩阵 D3DX 注入不需要: 8.0 FPU 已实测不受 D3D9 影响(precision=1)。
+	// 投影矩阵 D3DX 注入不需要: 8.0 FPU 已实测不受 D3D9 影响(precision=1)。
 
     FlushInstructionCache(proc, nullptr, 0);
-
-#if GM80_LOG
-    // ===================================================================
-    // [GM80] 补丁读回验证: 抽查代表性站点, 任一 MISMATCH => 该地址没写进去, 需立即排查。
-    // ===================================================================
-    gm_log("--- DllMain patch verification ---");
-    int gv = 0;
-    gv += gm_readback("SDK_VERSION push 32",       (void*)0x4a1e13, 0x00002068, 4);             // 68 20 00 00
-    gv += gm_readback("D3DCreate9 rel32",          (void*)0x484e00, (unsigned)((char*)&Direct3DCreate9 - (char*)0x484e04), 4);
-    gv += gm_readback("D3DCAPS @4a1f3e+1",         (void*)0x4a1f3f, (unsigned)(size_t)&d3d_caps, 4);
-    gv += gm_readback("D3DCAPS @4a2309+1",         (void*)0x4a230a, (unsigned)(size_t)&d3d_caps, 4);
-    gv += gm_readback("CreateDevice call",         (void*)0x4a1f1d, 0xE8, 1);                   // E8
-    gv += gm_readback("CreateDevice rel32",        (void*)0x4a1f1e, (unsigned)((char*)&CreateDevice - (char*)0x4a1f22), 4);
-    gv += gm_readback("D3DX dll-name ptr",         (void*)0x49a27c, (unsigned)(size_t)d3dx9_dll_name, 4);
-    gv += gm_readback("Reset slot @4a22ce+2",      (void*)0x4a22d0, 0x40, 1);
-    gv += gm_readback("Clear slot @49cb0b+2",      (void*)0x49cb0d, 0xac, 1);
-    gv += gm_readback("SetTexture slot @49cb89+2", (void*)0x49cb8b, 0x0104, 2);
-    gv += gm_readback("DrawPrimUP slot @49cbb6+2", (void*)0x49cbb8, 0x014c, 2);
-    gv += gm_readback("BeginScene slot @4a26fc+2", (void*)0x4a26fe, 0xa4, 1);
-    gv += gm_readback("Present slot @4a27ab+2",    (void*)0x4a27ad, 0x44, 1);
-    gv += gm_readback("GetRT jmp @4a0eb7",         (void*)0x4a0eb7, 0xE890, 2);
-    gv += gm_readback("SetVS call @49cb9b",        (void*)0x49cb9b, 0xE890, 2);
-    gv += gm_readback("SetVS rel32 @49cb9d",       (void*)0x49cb9d, (unsigned)((char*)&SetVertexShader - (char*)0x49cba1), 4);
-    g_patch_failures += gv;
-    gm_log("--- verification: %s (%u MISMATCH), WriteProcessMemory failures total=%d ---",
-           gv ? "FAIL" : "PASS", gv, g_patch_failures);
-    gm_log("=== GM82DX9 gm80_apply_patches done ===\n");
-#endif
 
     return true;
 }
