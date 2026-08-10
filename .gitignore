@@ -38,3 +38,5 @@ cmake-build-*
 todo.txt
 desktop.ini
 *.user
+__pycache__
+PORTING_NOTES.md
