@@ -39,6 +39,7 @@
     <ClInclude Include="Librarys\DirectXMath\DirectXMath.h">
       <Filter>头文件\Library</Filter>
     </ClInclude>
+    <ClInclude Include="source\d3d9_recovery.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="dllmain.cpp">
@@ -56,5 +57,6 @@
     <ClCompile Include="Librarys\dxerr\dxerr.cpp">
       <Filter>源文件\Library</Filter>
     </ClCompile>
+    <ClCompile Include="source\d3d9_recovery.cpp" />
   </ItemGroup>
 </Project>

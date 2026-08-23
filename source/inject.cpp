@@ -1,4 +1,5 @@
 ﻿#include "main.h"
+#include "d3d9_recovery.h"
 
 extern IDirect3DTexture9* white_pixel = nullptr;
 extern D3DPRESENT_PARAMETERS* present_params;
@@ -354,16 +355,8 @@ HRESULT WINAPI SetViewport_inj(IDirect3DDevice9* dev, D3DVIEWPORT9* vp)
 short old_cw = 0;
 short new_cw = 0;
 
-// Reset 接管: 8.0 runner 传 D3D8 布局 present params 给 Reset → D3D9 字段错位必失败。
-// CreateDevice 成功后把 vtable 槽 0x40 改指 ResetDevice 包装, 用创建时的干净 pp9 副本调真 Reset。
-static D3DPRESENT_PARAMETERS
-    g_pp9; // 设备创建时的 pp9 副本(与 CreateDevice 完全一致 → Reset 必成功)
-static HWND g_window = nullptr; // CreateDevice 传入的有效窗口
-static HRESULT(WINAPI* real_reset)(
-    IDirect3DDevice9*, D3DPRESENT_PARAMETERS*) = nullptr; // 原始 D3D9 Reset
 
-// CheckDeviceMultiSampleType 接管: D3D9 比 D3D8 多第 6 参 pQualityLevels, 8.0 只传 5 参
-// → D3D9 写栈垃圾。D3D 对象 vtable 槽 0x2C → 包装(补 &quality)。
+// CheckDeviceMultiSampleType 接管
 static HRESULT(WINAPI* real_check_ms)(IDirect3D9*, UINT, D3DDEVTYPE, D3DFORMAT, BOOL,
     D3DMULTISAMPLE_TYPE, DWORD*) = nullptr;
 
@@ -376,210 +369,6 @@ HRESULT WINAPI CheckDeviceMultiSampleType_wrap(IDirect3D9* d3d9, UINT Adapter,
         return real_check_ms(d3d9, Adapter, DeviceType, SurfaceFormat, Windowed,
             MultiSampleType, &quality);
     return D3DERR_INVALIDCALL;
-}
-
-static void gmdx9_on_reset_failure(IDirect3DDevice9* dev); // 定义在 PresentDevice 之后
-
-HRESULT WINAPI ResetDevice(IDirect3DDevice9* dev, D3DPRESENT_PARAMETERS* pParams)
-{
-    // 设备丢失恢复: Present 失败 → INNER_display_set_size → Reset。TestCooperativeLevel 判定:
-    // NOTRESET=真 Reset; S_OK/LOST=no-op(避免每帧真 Reset 黑屏)。
-    // 2026-08-16: real_reset 取槽 14(0x38, 真 Reset; 曾误取 vt[16]=GetBackBuffer → AV)。
-    // SEH 兜底 d3d9 极端状态: 崩溃时按"设备仍丢失"处理, runner 下帧重试, 绝不把进程拖死。
-    (void)pParams;
-    HRESULT tcl = dev->TestCooperativeLevel();
-    if (tcl == D3DERR_DEVICENOTRESET && real_reset)
-    {
-        if (!IsWindow(g_pp9.hDeviceWindow))
-            return D3DERR_DEVICELOST; // 创建时窗口已失效 → 无法安全 Reset, 等下帧
-        __try
-        {
-            HRESULT hr = real_reset(dev, &g_pp9);
-            if (FAILED(hr)) gmdx9_on_reset_failure(dev);
-            return hr;
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER)
-        {
-            gmdx9_on_reset_failure(dev);
-            return D3DERR_DEVICELOST;
-        }
-    }
-
-    return S_OK;
-}
-
-// Present 接管(槽 15 = 0x3C, runner 未补丁直接调用): 设备丢失时自恢复。
-// 2026-08-16 两轮实测结论:
-//  (1) 全吞错误 → runner 永不进 INNER_display_set_size → 死表面永不释放
-//      → 违反 D3D9 契约(Reset 前必须释放全部 DEFAULT 资源) → 真 Reset 遍历死资源 → AV 写垃圾地址;
-//  (2) 每帧放行 → runner 每帧 free 全部表面 → churn 损坏 d3d9 资源表 → 同样 AV。
-// 正确设计: DEVICELOST 时"首帧放行 + 每 1s 放行一次" → runner 的恢复路径(释放死表面)跑一次
-// 但不产生每帧 churn; NOTRESET 时由本包装直接 Reset(真 Reset 槽 14 + SEH 兜底)。
-static HRESULT(WINAPI* real_present)(IDirect3DDevice9*, const RECT*, const RECT*, HWND,
-    const RGNDATA*) = nullptr;
-static ULONGLONG g_last_lost_passthrough = 0;
-static const ULONGLONG LOST_PASSTHROUGH_COOLDOWN_MS = 1000;
-
-HRESULT WINAPI PresentDevice(IDirect3DDevice9* dev, const RECT* pSrc, const RECT* pDst,
-    HWND hWnd, const RGNDATA* pDirty)
-{
-    HRESULT hr = real_present(dev, pSrc, pDst, hWnd, pDirty);
-    if (hr == D3DERR_DEVICELOST)
-    {
-        ULONGLONG now = GetTickCount64();
-        if (g_last_lost_passthrough == 0 ||
-            now - g_last_lost_passthrough >= LOST_PASSTHROUGH_COOLDOWN_MS)
-        {
-            g_last_lost_passthrough = now;
-            return hr; // 放行: runner 的 INNER_display_set_size 跑一次(释放死表面+尝试 Reset)
-        }
-        return S_OK; // 冷却期内吞掉 → 无每帧 churn
-    }
-    if (hr == D3DERR_DEVICENOTRESET)
-    {
-        // 等可恢复后自行 Reset(真 Reset, 槽14已修正), 失败则下帧重试
-        HRESULT tcl = dev->TestCooperativeLevel();
-        if (tcl == D3DERR_DEVICENOTRESET && real_reset)
-        {
-            if (IsWindow(g_pp9.hDeviceWindow))
-            {
-                __try
-                {
-                    HRESULT hr2 = real_reset(dev, &g_pp9);
-                    if (FAILED(hr2)) gmdx9_on_reset_failure(dev);
-                }
-                __except (EXCEPTION_EXECUTE_HANDLER)
-                {
-                    gmdx9_on_reset_failure(dev);
-                }
-            }
-        }
-        return S_OK; // 无论成败都吞掉, 下帧重试
-    }
-    return hr;
-}
-void gm80_restore_reset_hook(void)
-{
-    __try
-    {
-        IDirect3DDevice9* dev = *(IDirect3DDevice9**)0x58d388;
-        if (!dev || !real_reset) return;
-        void** vt = *(void***)dev;
-        if (!vt) return;
-        DWORD oldp;
-        if (vt[16] != (void*)&ResetDevice) return; // 钩子已被别处改过 → 不碰
-        if (VirtualProtect(&vt[16], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldp))
-        {
-            vt[16] = (void*)real_reset;
-            VirtualProtect(&vt[16], sizeof(void*), oldp, &oldp);
-        }
-        if (vt[15] == (void*)&PresentDevice) // Present 钩子一并恢复
-        {
-            if (VirtualProtect(&vt[15], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldp))
-            {
-                vt[15] = (void*)real_present;
-                VirtualProtect(&vt[15], sizeof(void*), oldp, &oldp);
-            }
-        }
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-        // 设备已释放/不可读 → 忽略(进程/游戏正在结束)
-    }
-}
-
-// ============ 设备重建 (2026-08-16) ============
-// 实测: 本机 UAC/睡眠导致设备丢失后, d3d9 的 Reset 必然 AV(交换链视频内存指针失效,
-// 写 0xF6E0xxxx 崩溃, 崩溃点恒定) — 任何资源管理都无法修复旧设备。
-// 方案: 整个设备 Release + CreateDevice 重建, 替换 runner/插件的设备全局(0x58d388),
-// 并在新设备上重装 vt 钩子。游戏侧随后重建表面/图集/字体/shader。
-static IDirect3D9* g_d3d9 = nullptr;
-static UINT g_adapter = 0;
-static D3DDEVTYPE g_devtype = D3DDEVTYPE_HAL;
-static HWND g_focuswin = nullptr;
-static DWORD g_bf = 0;
-static int g_reset_fail_count = 0;
-static ULONGLONG g_last_recreate = 0;
-static const ULONGLONG RECREATE_COOLDOWN_MS = 2000;
-
-static void gmdx9_install_device_hooks(IDirect3DDevice9* dev)
-{
-    __try
-    {
-        void** vt = *(void***)dev;
-        DWORD oldp;
-        if (real_present)
-        {
-            if (VirtualProtect(&vt[15], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldp))
-            {
-                vt[15] = (void*)&PresentDevice;
-                VirtualProtect(&vt[15], sizeof(void*), oldp, &oldp);
-            }
-        }
-        if (real_reset)
-        {
-            if (VirtualProtect(&vt[16], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldp))
-            {
-                vt[16] = (void*)&ResetDevice; // runner 调用点已改指 [eax+40h]
-                VirtualProtect(&vt[16], sizeof(void*), oldp, &oldp);
-            }
-        }
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-    }
-}
-
-static HRESULT gmdx9_recreate_device(void)
-{
-    ULONGLONG now = GetTickCount64();
-    if (now - g_last_recreate < RECREATE_COOLDOWN_MS)
-        return E_FAIL; // 冷却中(创建失败也每 2s 重试)
-    g_last_recreate = now;
-    __try
-    {
-        IDirect3DDevice9* old = *(IDirect3DDevice9**)0x58d388;
-        if (old && old != (IDirect3DDevice9*)-1)
-            old->Release(); // 旧设备(丢失态)整体释放
-
-        // 2026-08-16: 适配器状态也可能损坏(CreateDevice 内部数组遍历 AV) →
-        // 连同 IDirect3D9 接口一起重建。
-        typedef IDirect3D9*(WINAPI* Direct3DCreate9_t)(UINT);
-        HMODULE d3d9dll = GetModuleHandleA("d3d9.dll");
-        Direct3DCreate9_t create9 = (Direct3DCreate9_t)GetProcAddress(d3d9dll, "Direct3DCreate9");
-        IDirect3D9* nd3d9 = create9 ? create9(D3D_SDK_VERSION) : nullptr;
-        if (!nd3d9)
-            return E_FAIL;
-        IDirect3DDevice9* nd = nullptr;
-        HRESULT hr = nd3d9->CreateDevice(
-            g_adapter, g_devtype, g_focuswin, g_bf, &g_pp9, &nd);
-        if (FAILED(hr))
-        {
-            nd3d9->Release();
-            return hr;
-        }
-        // runner + GMGraphic 都从 0x58d388 取设备; 接口全局(0x58d38C)一并更新
-        *(IDirect3DDevice9**)0x58d388 = nd;
-        *(IDirect3D9**)0x58d38C = nd3d9;
-        gmdx9_install_device_hooks(nd);
-        g_reset_fail_count = 0;
-        return S_OK;
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-        return E_FAIL;
-    }
-}
-
-// Reset 失败计数器: AV 两次后触发设备重建(旧设备已不可救药)。
-static void gmdx9_on_reset_failure(IDirect3DDevice9* dev)
-{
-    g_reset_fail_count++;
-    if (g_reset_fail_count >= 2)
-    {
-        g_reset_fail_count = 0;
-        gmdx9_recreate_device();
-    }
 }
 
 HRESULT WINAPI CreateDevice(IDirect3D9* d3d9, UINT Adapter, D3DDEVTYPE DeviceType,
@@ -600,7 +389,6 @@ HRESULT WINAPI CreateDevice(IDirect3D9* d3d9, UINT Adapter, D3DDEVTYPE DeviceTyp
     // 分辨率可调修复: 保持 runner 传入的 backbuffer 尺寸(显示器), 不缩到首个房间视图
     // (8.0 换分辨率不调 Reset, backbuffer 恒不变; 缩了会被夹住, 可见区永远卡在初始尺寸)。
 
-    // runner 栈上构造 D3D8 布局 present params → D3D9 字段错位。只采用开头 4 字段(布局一致), 其余干净重建 pp9。
     D3DPRESENT_PARAMETERS pp9;
     memset(&pp9, 0, sizeof(pp9));
     if (present_params)
@@ -614,12 +402,8 @@ HRESULT WINAPI CreateDevice(IDirect3D9* d3d9, UINT Adapter, D3DDEVTYPE DeviceTyp
     }
     pp9.SwapEffect = D3DSWAPEFFECT_COPY;
     pp9.hDeviceWindow = hFocusWindow; // 不读 runner 的字段(错位垃圾); 焦点窗口已验证有效
-    // GM8 只支持无边框全屏(2026-08-06 确认): "全屏"= runner 把窗口放大到显示尺寸,
-    // 设备始终 windowed, Present 自动拉伸到窗口。绝不能设 Windowed=FALSE(D3D9 独占全屏 ≠ GM8 行为)。
     pp9.Windowed = TRUE;
     pp9.PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
-    // 深度缓冲(2026-08-06, 对齐 gm82dx9 d3d_parameters): 启用 auto-depth-stencil,
-    // 3D 游戏的 d3d_set_hidden(z-test)/d3d_clear_depth 依赖它。D24S8 不支持则回退 D16。
     pp9.EnableAutoDepthStencil = TRUE;
     pp9.AutoDepthStencilFormat = D3DFMT_D24S8;
     if (d3d9->CheckDeviceFormat(Adapter, DeviceType, pp9.BackBufferFormat,
@@ -652,42 +436,11 @@ HRESULT WINAPI CreateDevice(IDirect3D9* d3d9, UINT Adapter, D3DDEVTYPE DeviceTyp
             Adapter, DeviceType, hFocusWindow, bf_used, &pp9, ppReturnedDeviceInterface);
     }
 
-    // Reset 接管(2026-08-05): 设备创建成功后把 vtable 槽 0x40(Reset)重定向到 ResetDevice 包装。
-    // 8.0 runner 的 Reset 调用(传 D3D8 布局 present params)经此包装用创建时的干净 pp9 调真实 Reset。
-    // Present 接管(2026-08-16): 槽 15 = Present, runner 未补丁直接调用 → 设备丢失时自恢复并吞错。
     if (SUCCEEDED(res) && ppReturnedDeviceInterface && *ppReturnedDeviceInterface)
     {
-        g_window = hFocusWindow;
-        g_pp9 = pp9;
-        // 设备重建所需参数(2026-08-16): 保存创建参数, 供 gmdx9_recreate_device 复用
-        g_d3d9 = d3d9;
-        g_adapter = Adapter;
-        g_devtype = DeviceType;
-        g_focuswin = hFocusWindow;
-        g_bf = bf_used;
-        IDirect3DDevice9* dev = *ppReturnedDeviceInterface;
-        void** vt = *(void***)dev;
-        DWORD oldp;
-        if (!real_present)
-        {
-            real_present = (HRESULT(WINAPI*)(IDirect3DDevice9*, const RECT*, const RECT*,
-                HWND, const RGNDATA*))vt[15]; // 槽 0x3C = Present
-            if (VirtualProtect(&vt[15], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldp))
-            {
-                vt[15] = (void*)&PresentDevice;
-                VirtualProtect(&vt[15], sizeof(void*), oldp, &oldp);
-            }
-        }
-        if (!real_reset)
-        {
-            real_reset = (HRESULT(WINAPI*)(
-                IDirect3DDevice9*, D3DPRESENT_PARAMETERS*))vt[14]; // 槽 0x38 = 真 Reset
-            if (VirtualProtect(&vt[16], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldp))
-            {
-                vt[16] = (void*)&ResetDevice; // runner 调用点已被 PATCH_SIMPLE 改指 [eax+40h]
-                VirtualProtect(&vt[16], sizeof(void*), oldp, &oldp);
-            }
-        }
+        // 设备丢失恢复核心(d3d9_recovery.cpp): 保存干净 pp9/创建参数 + 安装 Reset 钩子
+        gmdx9_recovery_on_device_created(*ppReturnedDeviceInterface, &pp9,
+            Adapter, DeviceType, hFocusWindow, bf_used);
         // CheckDeviceMultiSampleType 接管: D3D 对象 vtable 槽 0x2C → 包装(补 pQualityLevels)。
         if (!real_check_ms)
         {

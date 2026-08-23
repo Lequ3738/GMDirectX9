@@ -75,6 +75,7 @@
   <ItemGroup>
     <ClInclude Include="framework.h" />
     <ClInclude Include="pch.h" />
+    <ClInclude Include="source\d3d9_recovery.h" />
     <ClInclude Include="source\main.h" />
     <ClInclude Include="Librarys\dxerr\dxerr.h" />
     <ClInclude Include="Librarys\DirectXMath\DirectXMath.h" />
@@ -82,6 +83,7 @@
   <ItemGroup>
     <ClCompile Include="dllmain.cpp" />
     <ClCompile Include="pch.cpp" />
+    <ClCompile Include="source\d3d9_recovery.cpp" />
     <ClCompile Include="source\patch_support.cpp" />
     <ClCompile Include="source\inject.cpp" />
     <ClCompile Include="Librarys\dxerr\dxerr.cpp" />
