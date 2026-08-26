@@ -16,7 +16,8 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
     }
     else if (fdwReason == DLL_PROCESS_DETACH)
     {
-        // [GM80] 卸载安全: 恢复 vtable 槽 0x40(Reset), 避免卸载后跳未映射内存。
+        // [GM80] 卸载安全: 恢复 vtable 槽 0x104(SetTexture)与 0x40(Reset), 避免卸载后跳未映射内存。
+        gm80_restore_settexture_hook(); // (2026-08-26)
         gm80_restore_reset_hook();
     }
     return TRUE;

@@ -53,6 +53,7 @@ extern XMVECTOR vertex;
 extern HINSTANCE my_handle;
 bool gm80_apply_patches(void);
 void gm80_restore_reset_hook(void); // DLL 卸载时恢复 vtable Reset 钩子(2026-08-06)
+void gm80_restore_settexture_hook(void); // DLL 卸载时恢复 vtable SetTexture 钩子(2026-08-26)
 
 HRESULT WINAPI SetVertexShader(IDirect3DDevice9* dev, DWORD fvf);
 DWORD gm_col_to_dx9(double color);

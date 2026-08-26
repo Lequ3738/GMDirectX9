@@ -176,13 +176,12 @@ static const char gm80_fake_ffp_hlsl[] =
     "    return o;"                       "\n"
     "}"                                   "\n";
 
-static HRESULT gm80_ensure_fake_ffp_vs(IDirect3DDevice9* dev)
+static HRESULT gm80_compile_fake_ffp_vs(IDirect3DDevice9* dev, const char* hlsl,
+    size_t len, IDirect3DVertexShader9** out)
 {
-    if (gm80_fake_ffp_vs) return S_OK;
-
     ID3DXBuffer *code = nullptr, *errs = nullptr;
-    HRESULT hr = D3DXCompileShader(gm80_fake_ffp_hlsl,
-        (UINT)sizeof(gm80_fake_ffp_hlsl) - 1, nullptr, nullptr, "main", "vs_3_0", 0,
+    HRESULT hr = D3DXCompileShader(hlsl,
+        (UINT)len, nullptr, nullptr, "main", "vs_3_0", 0,
         &code, &errs, nullptr);
     if (FAILED(hr))
     {
@@ -190,9 +189,47 @@ static HRESULT gm80_ensure_fake_ffp_vs(IDirect3DDevice9* dev)
         return hr;
     }
 
-    hr = dev->CreateVertexShader((DWORD*)code->GetBufferPointer(), &gm80_fake_ffp_vs);
+    hr = dev->CreateVertexShader((DWORD*)code->GetBufferPointer(), out);
     code->Release();
     return hr;
+}
+
+static HRESULT gm80_ensure_fake_ffp_vs(IDirect3DDevice9* dev)
+{
+    if (gm80_fake_ffp_vs) return S_OK;
+    return gm80_compile_fake_ffp_vs(dev, gm80_fake_ffp_hlsl,
+        sizeof(gm80_fake_ffp_hlsl) - 1, &gm80_fake_ffp_vs);
+}
+
+// [2026-08-26] 形状签名仿固定管线 VS: 输入仅 POSITION+COLOR0(精确匹配引擎 shape 布局,
+// 16 字节 stride 无 UV)。输出仍声明 TEXCOORD0=(0,0), 保证 ps_3_0 的 dcl_texcoord v0
+// 拿到定义良好的值 —— 复用 2d 签名 VS 配 shape 声明会读未定义输入寄存器
+// (ps-only 下形状异常根因之一; 根因之二是空采样器采样为黑, 见 SetTexture_wrap)。
+static IDirect3DVertexShader9* gm80_fake_ffp_vs_shape = nullptr;
+static const char gm80_fake_ffp_shape_hlsl[] =
+    "float4x4 uWVP : register(c0);"       "\n"
+    "struct VS_IN {"                      "\n"
+    "    float4 pos: POSITION;"           "\n"
+    "    float4 color: COLOR0;"           "\n"
+    "};"                                  "\n"
+    "struct VS_OUT {"                     "\n"
+    "    float4 pos: POSITION;"           "\n"
+    "    float4 color: COLOR0;"           "\n"
+    "    float2 uv: TEXCOORD0;"           "\n"
+    "};"                                  "\n"
+    "VS_OUT main(VS_IN v) {"              "\n"
+    "    VS_OUT o;"                       "\n"
+    "    o.pos = mul(uWVP, v.pos);"       "\n"
+    "    o.color = v.color;"              "\n"
+    "    o.uv = float2(0, 0);"            "\n"
+    "    return o;"                       "\n"
+    "}"                                   "\n";
+
+static HRESULT gm80_ensure_fake_ffp_vs_shape(IDirect3DDevice9* dev)
+{
+    if (gm80_fake_ffp_vs_shape) return S_OK;
+    return gm80_compile_fake_ffp_vs(dev, gm80_fake_ffp_shape_hlsl,
+        sizeof(gm80_fake_ffp_shape_hlsl) - 1, &gm80_fake_ffp_vs_shape);
 }
 
 // 刷新仿固定管线 VS 的 WVP 常量。钩子在 DrawPrimitiveUP 前触发,
@@ -211,15 +248,19 @@ static HRESULT gm80_update_fake_ffp_wvp(IDirect3DDevice9* dev)
 }
 
 // 绑仿固定管线 VS: 声明按引擎 FVF 选 + WVP 常量 + VS。uWVP 是唯一 uniform → 编译器分配 c0-c3。
+// [2026-08-26] VS 按 FVF 签名分流: shape 布局(无 TEXCOORD0)配 shape 签名 VS;
+// 2d/3d 声明含 TEXCOORD0(@16/@28)共用 2d 签名 VS(3d 的 NORMAL/COLOR1 不读即合法)。
 static HRESULT gm80_bind_fake_ffp(IDirect3DDevice9* dev, DWORD fvf)
 {
     IDirect3DVertexDeclaration9** pdecl = nullptr;
     const D3DVERTEXELEMENT9* elems = nullptr;
+    bool shape_sig = false;
 
     if (fvf == (D3DFVF_XYZ | D3DFVF_DIFFUSE))
     {
         pdecl = &gm80_decl_shape;
         elems = gm80_elems_shape;
+        shape_sig = true;
     }
     else if (fvf == (D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1))
     {
@@ -234,7 +275,8 @@ static HRESULT gm80_bind_fake_ffp(IDirect3DDevice9* dev, DWORD fvf)
     else
         return D3DERR_INVALIDCALL;
 
-    HRESULT hr = gm80_ensure_fake_ffp_vs(dev);
+    HRESULT hr = shape_sig ? gm80_ensure_fake_ffp_vs_shape(dev)
+                           : gm80_ensure_fake_ffp_vs(dev);
     if (FAILED(hr)) return hr;
 
     hr = gm80_ensure_decl(dev, pdecl, elems);
@@ -243,7 +285,7 @@ static HRESULT gm80_bind_fake_ffp(IDirect3DDevice9* dev, DWORD fvf)
     hr = gm80_update_fake_ffp_wvp(dev);
     if (FAILED(hr)) return hr;
 
-    hr = dev->SetVertexShader(gm80_fake_ffp_vs);
+    hr = dev->SetVertexShader(shape_sig ? gm80_fake_ffp_vs_shape : gm80_fake_ffp_vs);
     if (FAILED(hr)) return hr;
 
     return dev->SetVertexDeclaration(*pdecl);
@@ -255,7 +297,7 @@ static HRESULT gm80_bind_fake_ffp(IDirect3DDevice9* dev, DWORD fvf)
 // 刷新函数通用。用户自定义 VS 不在此列(其常量自管)。
 static bool is_passthrough_vs(IDirect3DVertexShader9* vs)
 {
-    if (vs == gm80_fake_ffp_vs)
+    if (vs == gm80_fake_ffp_vs || vs == gm80_fake_ffp_vs_shape)
         return true;
     for (int i = 0; i < gmdx9_ffp_vs_count(); i++)
     {
@@ -301,6 +343,14 @@ HRESULT WINAPI SetVertexShader(IDirect3DDevice9* dev, DWORD fvf)
         // 到当前投影(surface_set_target 重设后)。
         if (is_passthrough_vs(vs))
         {
+            // [2026-08-26] 双向签名重绑: shape 布局要 shape 签名 VS(uv≡(0,0)),
+            // 2d/3d 要 2d 签名 VS。只换声明不换 VS 的后果: shape 绘制读未定义 uv
+            // (黑屏/花屏根因之一); 反向则精灵全采 uv=(0,0) 变纯色。两个透传 VS 均
+            // FFP 等价(uWVP@c0 + mul(uWVP,pos)), 互换安全; 用户自定义 VS 不在识别列。
+            bool want_shape = (fvf == (D3DFVF_XYZ | D3DFVF_DIFFUSE));
+            bool have_shape = (vs == gm80_fake_ffp_vs_shape);
+            if (want_shape != have_shape)
+                return gm80_bind_fake_ffp(dev, fvf);   // 整绑匹配签名的透传 VS + 声明 + WVP
             hr = gm80_update_fake_ffp_wvp(dev);
             if (FAILED(hr)) return hr;
         }
@@ -369,6 +419,81 @@ HRESULT WINAPI CheckDeviceMultiSampleType_wrap(IDirect3D9* d3d9, UINT Adapter,
         return real_check_ms(d3d9, Adapter, DeviceType, SurfaceFormat, Windowed,
             MultiSampleType, &quality);
     return D3DERR_INVALIDCALL;
+}
+
+// ---- [2026-08-26] SetTexture 白像素兜底(设备 vtable 槽 65 = 0x104) ----
+// ps-only 场景下引擎/GMGraphic 会把 stage0 置 NULL(无纹理图元): 固定管线对空采样器
+// 透传顶点色, 可编程 PS 的 tex2D 返回黑 → 形状全黑(ps-only 黑块根因之二)。
+// 钩子在 PS 激活时把 stage0 的 NULL 换成 1x1 白像素: 任意 UV 都采到白 →
+// tex2D(s0)*color 类 PS 在无纹理图元上退化为纯顶点色(FFP 观感)。
+// 真实纹理绑定与非 PS 绘制原样透传, 纹理路径零改动。
+
+static HRESULT(WINAPI* real_set_texture)(
+    IDirect3DDevice9*, DWORD, IDirect3DBaseTexture9*) = nullptr;
+static IDirect3DDevice9* g_white_pixel_dev = nullptr;
+
+// 懒创建 1x1 白像素(MANAGED 池跨设备 Reset 存活); 设备重建后按设备失配自动重建。
+// 用 D3DXCreateTexture+LockRect 而非内嵌 TGA: 保证 RGBA 全 1, 无文件格式歧义
+// (PS 会读到纹理 alpha, 与 FFP 只用顶点 alpha 不同, 必须确保不透明)。
+static void ensure_white_pixel(IDirect3DDevice9* dev)
+{
+    if (white_pixel && g_white_pixel_dev == dev) return;
+    if (white_pixel)
+    {
+        white_pixel->Release();
+        white_pixel = nullptr;
+    }
+    IDirect3DTexture9* t = nullptr;
+    if (FAILED(D3DXCreateTexture(dev, 1, 1, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &t)))
+        return;   // 设备丢失期创建失败 → 本调用退回透传, 下次再试
+    D3DLOCKED_RECT lr;
+    if (FAILED(t->LockRect(0, &lr, nullptr, 0)))
+    {
+        t->Release();
+        return;
+    }
+    *(DWORD*)lr.pBits = 0xFFFFFFFF;
+    t->UnlockRect(0);
+    white_pixel = t;
+    g_white_pixel_dev = dev;
+}
+
+HRESULT WINAPI SetTexture_wrap(
+    IDirect3DDevice9* dev, DWORD Stage, IDirect3DBaseTexture9* pTexture)
+{
+    if (Stage == 0 && pTexture == nullptr)
+    {
+        IDirect3DPixelShader9* ps = nullptr;
+        if (SUCCEEDED(dev->GetPixelShader(&ps)) && ps != nullptr)
+        {
+            ensure_white_pixel(dev);
+            if (white_pixel)
+                return real_set_texture(dev, 0, white_pixel);
+        }
+    }
+    return real_set_texture(dev, Stage, pTexture);
+}
+
+// DLL 卸载时恢复 vt[65](dllmain DLL_PROCESS_DETACH 调用)。
+void gm80_restore_settexture_hook(void)
+{
+    __try
+    {
+        IDirect3DDevice9* dev = Device;   // runner 全局 0x58d388
+        if (!dev || !real_set_texture) return;
+        void** vt = *(void***)dev;
+        if (!vt || vt[65] != (void*)&SetTexture_wrap) return; // 钩子已被别处改过 → 不碰
+        DWORD oldp;
+        if (VirtualProtect(&vt[65], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldp))
+        {
+            vt[65] = (void*)real_set_texture;
+            VirtualProtect(&vt[65], sizeof(void*), oldp, &oldp);
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        // 设备已释放/不可读 → 忽略(进程/游戏正在结束)
+    }
 }
 
 HRESULT WINAPI CreateDevice(IDirect3D9* d3d9, UINT Adapter, D3DDEVTYPE DeviceType,
@@ -441,6 +566,21 @@ HRESULT WINAPI CreateDevice(IDirect3D9* d3d9, UINT Adapter, D3DDEVTYPE DeviceTyp
         // 设备丢失恢复核心(d3d9_recovery.cpp): 保存干净 pp9/创建参数 + 安装 Reset 钩子
         gmdx9_recovery_on_device_created(*ppReturnedDeviceInterface, &pp9,
             Adapter, DeviceType, hFocusWindow, bf_used);
+        // [2026-08-26] SetTexture 白像素兜底钩子(vt[65]=0x104): 每个新设备对象都要重装。
+        // 真指针只需首次保存 —— 所有设备对象共享同一驱动实现地址。注: recovery 整设备
+        // 重建走直建路径不经本包装, 该新设备无此钩子(兜底静默失效, 不崩溃)。
+        {
+            void** dvt = *(void***)(*ppReturnedDeviceInterface);
+            DWORD oldp3;
+            if (!real_set_texture)
+                real_set_texture = (HRESULT(WINAPI*)(IDirect3DDevice9*, DWORD,
+                    IDirect3DBaseTexture9*))dvt[65];
+            if (VirtualProtect(&dvt[65], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldp3))
+            {
+                dvt[65] = (void*)&SetTexture_wrap;
+                VirtualProtect(&dvt[65], sizeof(void*), oldp3, &oldp3);
+            }
+        }
         // CheckDeviceMultiSampleType 接管: D3D 对象 vtable 槽 0x2C → 包装(补 pQualityLevels)。
         if (!real_check_ms)
         {
@@ -588,21 +728,9 @@ D3DXMATRIX* __stdcall D3DXMatrixOrthoLH_inj(
     _asm { fldcw [new_cw] }
 }
 
-uint8_t white_pixel_tga[] = {
-    0, 0, 2, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 1, 0, 1, 0,
-    32, 0, 255, 255, 255, 255
-};
-void create_white_pixel()
-{
-    D3DXCreateTextureFromFileInMemory(Device, white_pixel_tga, 22, &white_pixel);
-}
-
-HRESULT WINAPI SetNullTexture(
-    IDirect3DDevice9* dev, DWORD Stage, IDirect3DBaseTexture9* pTexture)
-{
-    return dev->SetTexture(0, white_pixel);
-}
+// [2026-08-26] 旧 white_pixel_tga/create_white_pixel/SetNullTexture 已删除:
+// 白像素改由 ensure_white_pixel 惰性创建(见 CreateDevice 上方), 置空兜底走
+// 设备 vtable 槽 65 的 SetTexture_wrap, 不再依赖逐路由点区分 NULL/非 NULL。
 
 // 由 dllmain.cpp 的 DllMain 在 DLL_PROCESS_ATTACH 时调用。
 bool gm80_apply_patches(void)
@@ -744,10 +872,8 @@ bool gm80_apply_patches(void)
     PATCH(0x4a0eb7)
 #undef PATCH
 
-    // SetTexture(0, NULL)→SetNullTexture：8.0 的 SetTexture 站点已统一补到 0x104；
-    // 是否区分"置 NULL"站点需要逐个确认参数，暂不启用 SetNullTexture 包装。
-
-    // white pixel 初始化: 8.0 无 D3DXCreateTextureFromFileInMemoryEx 调用点, 已删除。
+    // SetTexture(0,NULL) 白像素兜底不走路由点补丁: 已在设备 vtable 槽 65(0x104) 装
+    // SetTexture_wrap(CreateDevice 成功块安装), 覆盖引擎与外部 DLL(GMGraphic)的全部置空调用。
 
 #define PATCH_SIMPLE(a, off)                                                             \
     offset = off;                                                                        \
