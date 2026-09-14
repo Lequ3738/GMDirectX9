@@ -5,27 +5,10 @@ extern IDirect3DTexture9* white_pixel = nullptr;
 extern D3DPRESENT_PARAMETERS* present_params;
 
 D3DCAPS9 d3d_caps;
-D3DPRESENT_PARAMETERS d3d_parameters = {
-    .BackBufferCount = 1,
-    .MultiSampleType = D3DMULTISAMPLE_NONE,
-    .SwapEffect = D3DSWAPEFFECT_COPY,
-    .Windowed = 1,
-    .EnableAutoDepthStencil = TRUE,
-    .AutoDepthStencilFormat = D3DFMT_D24S8,
-    .PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE,
-};
 
 // 8.0 的 D3DX 是动态 LoadLibrary，runner 的加载器 (0x49A254) 用字符串 "\D3DX8.dll" 拼路径。
 // 改指这个插件字符串，runner 就会加载 D3DX9_43.dll（插件随扩展分发）。
 static const char d3dx9_dll_name[] = "\\D3DX9_43.dll";
-
-HRESULT WINAPI CheckDeviceMultiSampleType(IDirect3D9* d3d, UINT Adapter,
-    D3DDEVTYPE DeviceType, D3DFORMAT SurfaceFormat, BOOL Windowed,
-    D3DMULTISAMPLE_TYPE MultiSampleType)
-{
-    return d3d->CheckDeviceMultiSampleType(Adapter, DeviceType, SurfaceFormat,
-        Windowed, MultiSampleType, nullptr);
-}
 
 HRESULT WINAPI GetDisplayMode(IDirect3DDevice9* dev, D3DDISPLAYMODE* pMode)
 {
@@ -45,25 +28,6 @@ HRESULT WINAPI GetBackBuffer(IDirect3DDevice9* dev, UINT BackBuffer,
     return dev->GetBackBuffer(0, BackBuffer, Type, ppBackBuffer);
 }
 
-HRESULT WINAPI CreateVertexBuffer(IDirect3DDevice9* dev, UINT Length, DWORD Usage,
-    DWORD FVF, D3DPOOL Pool, IDirect3DVertexBuffer9** ppVertexBuffer)
-{
-    return dev->CreateVertexBuffer(Length, Usage, FVF, Pool, ppVertexBuffer, nullptr);
-}
-
-HRESULT WINAPI SetStreamSource(IDirect3DDevice9* dev, UINT StreamNumber,
-    IDirect3DVertexBuffer9* pStreamData, UINT Stride)
-{
-    return dev->SetStreamSource(StreamNumber, pStreamData, 0, Stride);
-}
-
-HRESULT WINAPI CreateDepthStencilSurface(IDirect3DDevice9* dev, UINT Width, UINT Height,
-    D3DFORMAT Format, D3DMULTISAMPLE_TYPE MultiSample, IDirect3DSurface9** ppSurface)
-{
-    return dev->CreateDepthStencilSurface(Width, Height, Format, MultiSample, 0, FALSE,
-        ppSurface, nullptr);
-}
-
 HRESULT WINAPI SetRenderTarget(IDirect3DDevice9* dev, IDirect3DSurface9* pRenderTarget,
     IDirect3DSurface9* pNewZStencil)
 {
@@ -77,43 +41,45 @@ HRESULT WINAPI GetRenderTarget(IDirect3DDevice9* dev, IDirect3DSurface9** ppRend
     return dev->GetRenderTarget(0, ppRenderTarget);
 }
 
+// [2026-09-14] 防御完整化: D3D8 语义允许 pSourceRectsArray=NULL(整面)与
+// pDestPointsArray=NULL(目标=源左上角), 且 cRects 可 >1 —— 逐矩形全部搬运。
+// IDA 已验证 runner 三个站点恒 cRects=1 且两数组非空, 此处为纵深防御。
 HRESULT WINAPI CopyRects(IDirect3DDevice9* dev, IDirect3DSurface9* pSourceSurface,
     CONST RECT* pSourceRectsArray, UINT cRects, IDirect3DSurface9* pDestinationSurface,
     CONST POINT* pDestPointsArray)
 {
-    RECT destRect;
-    destRect.left = pDestPointsArray->x;
-    destRect.top = pDestPointsArray->y;
-    destRect.right = destRect.left + (pSourceRectsArray->right - pSourceRectsArray->left);
-    destRect.bottom = destRect.top + (pSourceRectsArray->bottom - pSourceRectsArray->top);
+    if (cRects == 0 || !pSourceSurface || !pDestinationSurface)
+        return D3DERR_INVALIDCALL;
+
+    // 源矩形缺省 = 整个源表面
+    RECT srcFull{};
+    if (!pSourceRectsArray)
+    {
+        D3DSURFACE_DESC d{};
+        if (FAILED(pSourceSurface->GetDesc(&d))) return D3DERR_INVALIDCALL;
+        srcFull.right = (LONG)d.Width;
+        srcFull.bottom = (LONG)d.Height;
+        pSourceRectsArray = &srcFull;
+    }
+
     // AddDirtyRect 不需要: D3D9 表面无法反向取父纹理, 目标多为 default-pool 表面, 正确性无碍。
-    HRESULT hr = D3DXLoadSurfaceFromSurface(pDestinationSurface, nullptr, &destRect,
-        pSourceSurface, nullptr, pSourceRectsArray, D3DX_FILTER_NONE, 0);
+    HRESULT hr = S_OK;
+    for (UINT i = 0; i < cRects; ++i)
+    {
+        const RECT& src = pSourceRectsArray[i];
+        POINT dstPt{ 0, 0 };
+        if (pDestPointsArray)
+            dstPt = pDestPointsArray[i];
+        RECT dstRect;
+        dstRect.left = dstPt.x;
+        dstRect.top = dstPt.y;
+        dstRect.right = dstRect.left + (src.right - src.left);
+        dstRect.bottom = dstRect.top + (src.bottom - src.top);
+        hr = D3DXLoadSurfaceFromSurface(pDestinationSurface, nullptr, &dstRect,
+            pSourceSurface, nullptr, &src, D3DX_FILTER_NONE, 0);
+        if (FAILED(hr)) return hr;
+    }
     return hr;
-}
-
-HRESULT WINAPI D3DXGetErrorStringA(HRESULT hr, LPSTR pBuffer, UINT BufferLen)
-{
-    const wchar_t* wstr = DXGetErrorStringW(hr);
-    WideCharToMultiByte(CP_ACP, 0, wstr, -1, pBuffer, BufferLen, nullptr, nullptr);
-    return S_OK;
-}
-
-HRESULT WINAPI screen_refresh(IDirect3DDevice9* dev, const RECT* pSourceRect,
-    const RECT* pDestRect, HWND hDestOverride, const RGNDATA* pDirtyRegion)
-{
-    dev->EndScene();
-    auto res = dev->Present(pSourceRect, pDestRect, hDestOverride, pDirtyRegion);
-    dev->BeginScene();
-    return res;
-}
-
-void WINAPI regain_device()
-{
-    // force exclusive fullscreen off
-    d3d_parameters.Windowed = TRUE;
-    d3d_parameters.FullScreen_RefreshRateInHz = 0;
-    (*runner_display_reset)();
 }
 
 // SetVertexShader 包装: runner 每绘制 SetVertexShader(FVF)。有自定义 VS 时
@@ -317,7 +283,9 @@ HRESULT WINAPI SetVertexShader(IDirect3DDevice9* dev, DWORD fvf)
     if (SUCCEEDED(dev->GetVertexShader(&vs)) && vs != nullptr)
     {
         // 自定义 VS 已绑定: 引擎的 FVF 重置 → 声明切换, VS 保持。
-        // 注: D3D9 的 GetVertexShader 不 AddRef 返回对象, 无需 Release。
+        // [2026-09-14] GetVertexShader 会给返回对象加引用(RecoveryTest R8 实证;
+        // 旧注释"D3D9 惯例不 AddRef"有误), 本分支所有出口用完必须 Release,
+        // 否则引擎每次绘制的 FVF 重置都泄漏一个引用 → shader_destroy 后设备对象无法释放。
         HRESULT hr;
         IDirect3DVertexDeclaration9* decl = nullptr;
         if (fvf == (D3DFVF_XYZ | D3DFVF_DIFFUSE))
@@ -336,9 +304,16 @@ HRESULT WINAPI SetVertexShader(IDirect3DDevice9* dev, DWORD fvf)
             decl = gm80_decl_3d;
         }
         else
+        {
+            vs->Release();
             return D3DERR_INVALIDCALL; // 未知 FVF + 自定义 VS: 引擎忽略返回值, 保持上次声明
-        
-        if (FAILED(hr)) return hr;
+        }
+
+        if (FAILED(hr))
+        {
+            vs->Release();
+            return hr;
+        }
         // [2026-08-08] 若当前 VS 是本钩子绑的仿固定管线 VS(ps-only 场景), 每绘制刷一次 WVP
         // (投影可能已变, 如换视图/d3d_set_projection)。用户自定义 VS 不在此列(其常量自管)。
         // [2026-08-09] 注册模式: 同样识别插件注册的透传 VS(如 GMGraphic 的 s_passthrough_vs),
@@ -353,17 +328,27 @@ HRESULT WINAPI SetVertexShader(IDirect3DDevice9* dev, DWORD fvf)
             bool want_shape = (fvf == (D3DFVF_XYZ | D3DFVF_DIFFUSE));
             bool have_shape = (vs == gm80_fake_ffp_vs_shape);
             if (want_shape != have_shape)
+            {
+                vs->Release();
                 return gm80_bind_fake_ffp(dev, fvf);   // 整绑匹配签名的透传 VS + 声明 + WVP
+            }
             hr = gm80_update_fake_ffp_wvp(dev);
-            if (FAILED(hr)) return hr;
+            if (FAILED(hr))
+            {
+                vs->Release();
+                return hr;
+            }
         }
+        vs->Release();
         return dev->SetVertexDeclaration(decl);
     }
     // 仿固定管线 VS 兜底: 无自定义 VS 但自定义 PS 激活(ps-only)时绑定喂 v0/v1;
     // 实测 ps_3_0 仍全透明 → GMGraphic 已回退 ps_2_0, 本分支留作 vs_3_0 透传 VS 实验。
+    // [2026-09-14] GetPixelShader 同样加引用(与 R8 实证同族), 用完 Release。
     IDirect3DPixelShader9* ps = nullptr;
     if (SUCCEEDED(dev->GetPixelShader(&ps)) && ps != nullptr)
     {
+        ps->Release();
         return gm80_bind_fake_ffp(dev, fvf);
     }
     return dev->SetFVF(fvf);
@@ -404,9 +389,6 @@ HRESULT WINAPI SetViewport_inj(IDirect3DDevice9* dev, D3DVIEWPORT9* vp)
     }
     return dev->SetViewport(vp);
 }
-
-short old_cw = 0;
-short new_cw = 0;
 
 
 // CheckDeviceMultiSampleType 接管
@@ -472,6 +454,7 @@ HRESULT WINAPI SetTexture_wrap(
         IDirect3DPixelShader9* ps = nullptr;
         if (SUCCEEDED(dev->GetPixelShader(&ps)) && ps != nullptr)
         {
+            ps->Release();   // Get 加引用(见 R8 实证), 判定完立即还
             ensure_white_pixel(dev);
             if (white_pixel)
                 return real_set_texture(dev, 0, white_pixel);
@@ -839,13 +822,9 @@ HRESULT WINAPI CreateDevice(IDirect3D9* d3d9, UINT Adapter, D3DDEVTYPE DeviceTyp
     D3DPRESENT_PARAMETERS* pPresentationParameters,
     IDirect3DDevice9** ppReturnedDeviceInterface)
 {
-    // _control87 doesn't seem to let us reset the control word, so we're going asm
-    if (old_cw == 0)
-    {
-        _asm fnstcw[old_cw];
-        new_cw = old_cw | 0x3f;
-        _asm fldcw[new_cw];
-    }
+    // [2026-09-14] gm82dx9 的 FPU 控制字舞蹈与数学 trampoline 已整体移除:
+    // 8.0 的 CreateDevice 带 D3DCREATE_FPU_PRESERVE(0x22), 实测 precision=1,
+    // D3D9 不改写控制字(§10), 原 trampoline 服务的 8.1 场景不存在于 8.0。
 
     present_params = pPresentationParameters;
 
@@ -854,6 +833,7 @@ HRESULT WINAPI CreateDevice(IDirect3D9* d3d9, UINT Adapter, D3DDEVTYPE DeviceTyp
 
     D3DPRESENT_PARAMETERS pp9;
     memset(&pp9, 0, sizeof(pp9));
+    DWORD runner_ms = D3DMULTISAMPLE_NONE;
     if (present_params)
     {
         pp9.BackBufferWidth = present_params->BackBufferWidth;
@@ -862,11 +842,33 @@ HRESULT WINAPI CreateDevice(IDirect3D9* d3d9, UINT Adapter, D3DDEVTYPE DeviceTyp
         pp9.BackBufferCount = present_params->BackBufferCount
             ? present_params->BackBufferCount
             : 1;
+        // [2026-09-14] MSAA 尊重 runner 传入值。注意布局: runner 传的是 D3D8 结构
+        // (无 0x14 MultiSampleQuality, 之后全部错位) —— MultiSampleType 两代都在
+        // 0x10 可直读。IDA 证实 8.0 两个 pp 构造点(sub_4A1DA0 / INNER_display_set_size)
+        // 都先 52 字节清零且从不写 0x10, 此处恒得 NONE —— 保留透传仅为纵深防御。
+        runner_ms = present_params->MultiSampleType;
+        if (runner_ms > D3DMULTISAMPLE_16_SAMPLES)
+            runner_ms = D3DMULTISAMPLE_NONE;
+        pp9.MultiSampleType = (D3DMULTISAMPLE_TYPE)runner_ms;
     }
-    pp9.SwapEffect = D3DSWAPEFFECT_COPY;
+    // [2026-09-14 三批] 呈现节奏恒 IMMEDIATE(窗口化), 不透传 runner 的 interval 字段。
+    // 原因: IDA 证实 runner 窗口化 pp 恒写 interval=0(DEFAULT) + SwapEffect=COPY_VSYNC(3)
+    // (sub_4A1DA0@0x4a1e93 与 INNER_display_set_size@0x4a2287, 两处均无条件) ——
+    // set_synchronization 根本不进窗口化 pp, GM8 的同步开关在 D3D8 语义里依附于
+    // COPY_VSYNC 交换效果, Win10 DWM 下近似无效(Present 从不阻塞 CPU)。而 D3D9 的
+    // COPY+DEFAULT 是真阻塞的垂直同步(每帧 Present 等 vblank/DWM 合成才返回),
+    // 透传 0 等于替游戏强制开 sync —— 曾实测由此 set_synchronization(false) 被无视。
+    // 故窗口化恒 IMMEDIATE(gm82dx9 同款选择)。垂直同步由 runner 自带机制落实:
+    // INNER_screen_refresh(每帧 Present 前读同步标志 0x58D3A0, 非零则 DirectDraw
+    // WaitForVerticalBlank 软等待, 0x4a2840→0x4a2842) —— 该路径不经过 d3d8.dll,
+    // 本插件的 D3D8→D3D9 移植不触及; IMMEDIATE 恰使 Present 落在回扫等待之后。
+    pp9.PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
+    // COPY 交换效果不支持多重采样, 请求 MSAA 时换 DISCARD(D3D9 硬性要求)。
+    pp9.SwapEffect = (pp9.MultiSampleType != D3DMULTISAMPLE_NONE)
+        ? D3DSWAPEFFECT_DISCARD
+        : D3DSWAPEFFECT_COPY;
     pp9.hDeviceWindow = hFocusWindow; // 不读 runner 的字段(错位垃圾); 焦点窗口已验证有效
     pp9.Windowed = TRUE;
-    pp9.PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
     pp9.EnableAutoDepthStencil = TRUE;
     pp9.AutoDepthStencilFormat = D3DFMT_D24S8;
     if (d3d9->CheckDeviceFormat(Adapter, DeviceType, pp9.BackBufferFormat,
@@ -889,15 +891,7 @@ HRESULT WINAPI CreateDevice(IDirect3D9* d3d9, UINT Adapter, D3DDEVTYPE DeviceTyp
             Adapter, DeviceType, hFocusWindow, bf_orig, &pp9, ppReturnedDeviceInterface);
         bf_used = SUCCEEDED(res) ? bf_orig : bf_hw;
     }
-    // 全屏失败(D3DERR_NOTAVAILABLE 常见于基本显示适配器/远程桌面不支持全屏) → 回退窗口模式
-    if (FAILED(res) && !pp9.Windowed)
-    {
-        pp9.Windowed = TRUE;
-        if (!pp9.BackBufferWidth) pp9.BackBufferWidth = 640;
-        if (!pp9.BackBufferHeight) pp9.BackBufferHeight = 480;
-        res = d3d9->CreateDevice(
-            Adapter, DeviceType, hFocusWindow, bf_used, &pp9, ppReturnedDeviceInterface);
-    }
+    // (pp9.Windowed 恒 TRUE, 无全屏失败回退分支; 窗口化是 §12 定案)
 
     if (SUCCEEDED(res) && ppReturnedDeviceInterface && *ppReturnedDeviceInterface)
     {
@@ -925,134 +919,10 @@ HRESULT WINAPI CreateDevice(IDirect3D9* d3d9, UINT Adapter, D3DDEVTYPE DeviceTyp
     return res;
 }
 
-#define CW_INJ_START(name)                        \
-    __declspec(naked) void name##_inj() { __asm { \
-        __asm fldcw [old_cw]
-#define CW_INJ_END() \
-        __asm fldcw [new_cw] \
-        __asm ret 0xc        \
-        }                    \
-    }
-#define CW_INJ_ENDD()        \
-        __asm fldcw [new_cw] \
-        __asm ret 0x8        \
-        }                    \
-    }
-#define CW_INJ_END2()            \
-            __asm fldcw [new_cw] \
-            __asm ret 0x18       \
-        }                        \
-    }
-
-
-CW_INJ_START(sqrt)
-    _asm fld tbyte ptr [esp + 4]
-    _asm fsqrt
-CW_INJ_END()
-
-CW_INJ_START(ln)
-    fld tbyte ptr [esp + 4]
-    fldln2
-    fxch
-    fyl2x
-CW_INJ_END()
-
-CW_INJ_START(log2)
-    fld1
-    fld tbyte ptr [esp + 4]
-    fyl2x
-CW_INJ_END()
-
-CW_INJ_START(log10)
-    fldlg2
-    fld tbyte ptr [esp + 4]
-    fyl2x
-CW_INJ_END()
-
-CW_INJ_START(arcsin)
-    fld qword ptr [esp + 4]
-    fld1
-    fadd st(0), st(1)
-    fld1
-    fsub st(0), st(2)
-    fmulp st(1), st(0)
-    fsqrt
-    fpatan
-CW_INJ_ENDD()
-
-CW_INJ_START(arccos)
-    fld qword ptr [esp + 4]
-    fld1
-    fadd st(0), st(1)
-    fld1
-    fsub st(0), st(2)
-    fmulp st(1), st(0)
-    fsqrt
-    fxch
-    fpatan
-CW_INJ_ENDD()
-
-CW_INJ_START(arctan)
-    fld tbyte ptr [esp + 4]
-    fld1
-    fpatan
-CW_INJ_END()
-
-CW_INJ_START(arctan2)
-    fld tbyte ptr [esp + 0x10]
-    fld tbyte ptr [esp + 4]
-    fpatan
-CW_INJ_END2()
-
-CW_INJ_START(logn)
-    fld1
-    fld tbyte ptr [esp + 4]
-    fyl2x
-    fld1
-    fld tbyte ptr [esp + 0x10]
-    fyl2x
-    fdivp st(1), st(0)
-CW_INJ_END2()
-
-CW_INJ_START(exp)
-    __asm push dword ptr [esp + 0xc]
-    __asm push dword ptr [esp + 0xc]
-    __asm push dword ptr [esp + 0xc]
-    __asm mov eax, 0x404844
-    __asm call eax
-CW_INJ_END()
-
-CW_INJ_START(power)
-    __asm push dword ptr [esp + 0x10]
-    __asm push dword ptr [esp + 0x10]
-    __asm push dword ptr [esp + 0x10]
-    __asm push dword ptr [esp + 0x10]
-    __asm mov eax, 0x4103d8
-    __asm call eax
-    __asm fldcw [new_cw]
-    __asm ret 0x10
-}}
-
-typedef D3DXMATRIX*(__stdcall* d3dx_matrix_func)(
-    D3DXMATRIX* pOut, FLOAT w, FLOAT h, FLOAT zn, FLOAT zf);
-
-d3dx_matrix_func D3DXMatrixPerspectiveLH_ptr, D3DXMatrixOrthoLH_ptr;
-
-D3DXMATRIX* __stdcall D3DXMatrixPerspectiveLH_inj(
-    D3DXMATRIX* pOut, FLOAT w, FLOAT h, FLOAT zn, FLOAT zf)
-{
-    _asm { fldcw [old_cw] }
-    D3DXMatrixPerspectiveLH_ptr(pOut, w, h, zn, zf);
-    _asm { fldcw [new_cw] }
-}
-
-D3DXMATRIX* __stdcall D3DXMatrixOrthoLH_inj(
-    D3DXMATRIX* pOut, FLOAT w, FLOAT h, FLOAT zn, FLOAT zf)
-{
-    _asm { fldcw [old_cw] }
-    D3DXMatrixOrthoLH_ptr(pOut, w, h, zn, zf);
-    _asm { fldcw [new_cw] }
-}
+// [2026-09-14] gm82dx9 的 FPU 控制字 trampoline(sqrt/ln/log/arcsin/.../power)与
+// D3DXMatrix 投影矩阵注入函数已整体移除: 8.0 的 CreateDevice 带 FPU_PRESERVE,
+// D3D9 不改写控制字(§10 实测 precision=1), 这些 trampoline 服务的 8.1 场景在
+// 8.0 不存在, 且从未被本工程的补丁表引用。
 
 // [2026-08-26] 旧 white_pixel_tga/create_white_pixel/SetNullTexture 已删除:
 // 白像素改由 ensure_white_pixel 惰性创建(见 CreateDevice 上方), 置空兜底走

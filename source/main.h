@@ -16,10 +16,6 @@
 #include <map>
 
 #include "d3dx9.h"
-#include "dxerr/dxerr.h"
-#include "DirectXMath/DirectXMath.h"
-
-using namespace DirectX;
 
 typedef int(__cdecl* DLL_FUNC)();
 typedef struct
@@ -31,23 +27,10 @@ typedef struct
     int padding2;
 } GMVAL;
 
-extern int has_started;
-
 extern IDirect3DDevice9** d3d9_device;
 #define Device (*d3d9_device)
 
 extern D3DPRESENT_PARAMETERS* present_params;
-
-extern int* dx9_backbuffer_format;
-
-extern void (*runner_display_reset)();
-
-extern D3DVIEWPORT9 viewport;
-extern D3DRASTER_STATUS raster_status;
-extern XMMATRIX world_matrix;
-extern D3DPRESENT_PARAMETERS d3d_parameters;
-extern D3DCAPS9 d3d_caps;
-extern XMVECTOR vertex;
 
 // [GM80] dllmain.cpp ↔ inject.cpp 共享
 extern HINSTANCE my_handle;
@@ -56,112 +39,11 @@ void gm80_restore_reset_hook(void); // DLL 卸载时恢复 vtable Reset 钩子(2
 void gm80_restore_device_hooks(void); // DLL 卸载时恢复 vtable 钩子组: SetTexture(白像素)+flush 全族(2026-09-14 二批扩至提交/状态/内容 43 槽)
 bool gmdx9_install_render_hooks(IDirect3DDevice9* dev); // 设备 vtable 钩子组安装(CreateDevice 与 recovery 重建路径共用)
 void gmdx9_fire_flush(void); // flush 钩子入口(提交/目标/状态族): 依次调用注册的插件 flush 回调(patch_support)
+void gmdx9_fire_reset_pre(void);   // 设备 Reset 前回调(注册口 gmdx9_register_reset_callback, 见 patch_support)
+void gmdx9_fire_reset_post(bool recreated); // 设备 Reset/重建成功后回调(recreated=true = 整设备重建)
 
 HRESULT WINAPI SetVertexShader(IDirect3DDevice9* dev, DWORD fvf);
-DWORD gm_col_to_dx9(double color);
-double dx9_col_to_gm(DWORD color);
 
-bool __vibe_check(const wchar_t* file, int line, HRESULT hr);
-void __show_error(const wchar_t* file, int line, const char* message);
-#define WIDE2(x) L##x
-#define WIDE1(x) WIDE2(x)
-#define WFILE WIDE1(__FILE__)
-#define vibe_check(a) __vibe_check(WFILE, __LINE__, a)
-#define show_error(a) __show_error(WFILE, __LINE__, a)
-
-#define GM_WRITE(addr, buf, len) WriteProcessMemory(proc, (void*)(addr), (buf), (len), nullptr)
-
-union messy_matrix_glue
-{
-    D3DMATRIX* matrix;
-    int pointer;
-};
-
-// GMSURFACE 16B/项(textureId,width,height,exists), 无 zbuffer; 8.1 是 20B, 步长必须对齐。
-struct GMSurface
-{
-    unsigned int texture, width, height;
-    bool exists;
-};
-
-struct GMTexture
-{
-    IDirect3DTexture9* texture;
-    unsigned int width, height, width_pow2, height_pow2;
-    bool exists;
-};
-
-extern GMSurface** gm_surfaces;
-extern GMTexture** gm_textures;
-
-GMSurface* get_gm_surface(double id);
-GMTexture* get_gm_texture(int id);
-
-struct VShaderWithTable
-{
-    IDirect3DVertexShader9* shader;
-    ID3DXConstantTable* constants;
-};
-
-struct PShaderWithTable
-{
-    IDirect3DPixelShader9* shader;
-    ID3DXConstantTable* constants;
-};
-
-struct VertexBuffer
-{
-    IDirect3DVertexBuffer9* vbuf;
-    UINT stride;
-};
-
-struct VertexFormat
-{
-    IDirect3DVertexDeclaration9* decl;
-    std::array<WORD, 16> sizes;
-};
-
-struct DXData
-{
-    unsigned int idcounter_vertex, idcounter_pixel;
-    unsigned int idcounter_vbuf, idcounter_ibuf, idcounter_vformat;
-
-    std::map<unsigned int, VShaderWithTable> vertex_shaders;
-    std::map<unsigned int, PShaderWithTable> pixel_shaders;
-    std::map<unsigned int, VertexBuffer> vertex_buffers;
-    std::map<unsigned int, IDirect3DIndexBuffer9*> index_buffers;
-    std::map<unsigned int, VertexFormat> vertex_formats;
-
-    ~DXData()
-    {
-        for (auto& shader : vertex_shaders)
-        {
-            ((shader.second).shader)->Release();
-            ((shader.second).constants)->Release();
-        }
-        for (auto& shader : pixel_shaders)
-        {
-            ((shader.second).shader)->Release();
-            ((shader.second).constants)->Release();
-        }
-        for (auto& vbuf : vertex_buffers)
-        {
-            vbuf.second.vbuf->Release();
-        }
-        for (auto& ibuf : index_buffers)
-        {
-            ibuf.second->Release();
-        }
-        for (auto& vformat : vertex_formats)
-        {
-            vformat.second.decl->Release();
-        }
-    }
-};
-
-extern DXData dx_data;
-
-extern IDirect3DTexture9* white_pixel;
-
+// FFP VS 注册槽查询(patch_support 定义, inject.cpp 的 SetVertexShader 钩子使用)
 int  gmdx9_ffp_vs_count(void);
 void** gmdx9_ffp_vs_slot(int i);

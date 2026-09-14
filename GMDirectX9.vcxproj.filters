@@ -33,12 +33,6 @@
     <ClInclude Include="source\main.h">
       <Filter>头文件\Project</Filter>
     </ClInclude>
-    <ClInclude Include="Librarys\dxerr\dxerr.h">
-      <Filter>头文件\Library</Filter>
-    </ClInclude>
-    <ClInclude Include="Librarys\DirectXMath\DirectXMath.h">
-      <Filter>头文件\Library</Filter>
-    </ClInclude>
     <ClInclude Include="source\d3d9_recovery.h" />
   </ItemGroup>
   <ItemGroup>
@@ -53,9 +47,6 @@
     </ClCompile>
     <ClCompile Include="source\patch_support.cpp">
       <Filter>源文件\Core</Filter>
-    </ClCompile>
-    <ClCompile Include="Librarys\dxerr\dxerr.cpp">
-      <Filter>源文件\Library</Filter>
     </ClCompile>
     <ClCompile Include="source\d3d9_recovery.cpp" />
   </ItemGroup>
