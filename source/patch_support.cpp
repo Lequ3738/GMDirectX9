@@ -1,11 +1,9 @@
 // GMDirectX9 纯 patch 版(2026-08-06 重构): 无 GML 导出, 只在 DllMain 里把 GM8.0 runner 的
-// D3D8 渲染后端替换为 D3D9。此文件仅保留补丁核心(inject.cpp)依赖的共享符号定义。
+// D3D8 渲染后端替换为 D3D9。此文件保留补丁核心(inject.cpp)依赖的共享符号定义
+// 与对外注册口(flush / FFP VS / 设备 Reset 前后回调)。
 #include "main.h"
 
 D3DPRESENT_PARAMETERS* present_params;
-
-// runner_display_reset = 0x4a2228 = INNER_display_set_size
-create_c_function(void, runner_display_reset, 0x4a2228);
 
 // d3d9_device = 0x58d388 (GMAPI GMDIRECT3DINFO.direct3dDevice, 原 8.1 为 0x6886a8)
 IDirect3DDevice9** d3d9_device = (IDirect3DDevice9**)0x58d388;
@@ -85,4 +83,45 @@ void gmdx9_fire_flush(void)
     for (int i = 0; i < n; i++)
         g_flush_cbs[i]();
     g_flush_active = false;
+}
+
+// ---- 设备 Reset 前后回调(2026-09-14, 设备丢失恢复配套) ----
+// 背景: D3D9 的 Reset 要求进程内不存在未释放的 D3DPOOL_DEFAULT 资源(否则
+// INVALIDCALL), 且 Reset 成功后 DEFAULT 资源内容失效。外部 DLL(GMGraphic 的 gpart
+// RT 状态纹理等)持有的 DEFAULT 资源会卡死 runner 的原生自愈循环。
+// 契约(由 d3d9_recovery.cpp 的 ResetDevice/recreate 路径调用):
+//   pre  : real Reset 之前触发 —— 释放 DEFAULT 资源、丢弃依赖它们的挂起状态。
+//          必须幂等: Reset 失败后 runner 每帧重试, pre 会再次触发, 已释放即空操作。
+//   post : Reset 成功后触发(recreated=false), 或整设备重建成功后触发(recreated=true)。
+//          recreated=true 时旧设备上的一切对象(含 MANAGED/着色器/声明)均已消亡,
+//          注册方需全量重建; false 时仅需重建 DEFAULT 资源(MANAGED 自动存活)。
+// pre 触发过而 Reset 未成功时不调 post —— 注册方保持在"已释放"态等下一次机会。
+static void (*g_reset_pre_cbs[4])(void) = {};
+static void (*g_reset_post_cbs[4])(bool) = {};
+static int  g_reset_cb_count = 0;   // pre/post 成对注册, 单计数器
+
+extern "C" __declspec(dllexport) int __cdecl gmdx9_register_reset_callback(
+    void (*pre)(void), void (*post)(bool))
+{
+    if (!pre || !post) return -1;
+    for (int i = 0; i < g_reset_cb_count; i++)
+        if (g_reset_pre_cbs[i] == pre && g_reset_post_cbs[i] == post)
+            return 0;   // 已注册
+    if (g_reset_cb_count >= 4) return -1;
+    g_reset_pre_cbs[g_reset_cb_count] = pre;
+    g_reset_post_cbs[g_reset_cb_count] = post;
+    g_reset_cb_count++;
+    return 0;
+}
+
+void gmdx9_fire_reset_pre(void)
+{
+    for (int i = 0; i < g_reset_cb_count; i++)
+        g_reset_pre_cbs[i]();
+}
+
+void gmdx9_fire_reset_post(bool recreated)
+{
+    for (int i = 0; i < g_reset_cb_count; i++)
+        g_reset_post_cbs[i](recreated);
 }

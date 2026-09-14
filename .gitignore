@@ -4,6 +4,8 @@
 /Debug/
 /Release/
 /obj/
+/tests/bin/
+/tests/obj/
 /.vs/
 *.tlog
 *.recipe

@@ -82,14 +82,22 @@ HRESULT WINAPI ResetDevice(IDirect3DDevice9* dev, D3DPRESENT_PARAMETERS* pParams
         return D3DERR_DEVICELOST;
     if (!IsWindow(g_pp9.hDeviceWindow))
         return D3DERR_DEVICELOST; // 创建时窗口已失效 → 无法安全 Reset, 等下帧
-    
+
+    // [2026-09-14] Reset 前回调: D3D9 要求 Reset 时进程内无未释放的 DEFAULT 池资源
+    // (否则 INVALIDCALL, 设备永久卡死) —— 外部 DLL(GMGraphic)的 DEFAULT 资源必须
+    // 先释放。pre 幂等: Reset 失败后 runner 每帧重试, 已释放即空操作; 失败不调 post。
+    gmdx9_fire_reset_pre();
+
     __try
     {
-        return real_reset(dev, &g_pp9);
+        HRESULT hr = real_reset(dev, &g_pp9);
+        if (SUCCEEDED(hr))
+            gmdx9_fire_reset_post(false);   // 同设备 Reset: 仅 DEFAULT 资源需重建
+        return hr;
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
-        // 真 Reset 内部硬崩溃：整体重建兜底
+        // 真 Reset 内部硬崩溃：整体重建兜底(post(recreated=true) 在重建成功后触发)
         gmdx9_recreate_device();
         return D3DERR_DEVICELOST;
     }
@@ -171,6 +179,10 @@ static HRESULT gmdx9_recreate_device(void)
         }
         recovery_publish_runner_device(nd, nd3d9);
         gmdx9_install_device_hooks(nd);
+        // [2026-09-14] 整设备重建成功: 旧设备上的一切对象(含 MANAGED/着色器/声明)
+        // 已消亡, 通知注册方全量重建。旧设备已在上面 Release, DEFAULT 资源随之不存在,
+        // 新设备干净无需 pre。
+        gmdx9_fire_reset_post(true);
         return S_OK;
     }
     __except (EXCEPTION_EXECUTE_HANDLER)

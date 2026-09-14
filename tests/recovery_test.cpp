@@ -12,7 +12,16 @@
 #define GMDX9_RECOVERY_TEST
 #endif
 #include "../source/d3d9_recovery.h"
+#include "d3dx9.h"
 #include <stdio.h>
+#include <string.h>
+
+// patch_support.cpp 的 reset 回调注册口(extern "C" dllexport; 测试直接链接声明)
+extern "C" int __cdecl gmdx9_register_reset_callback(void (*pre)(void), void (*post)(bool));
+
+// inject.cpp 的设备 vtable 钩子组安装在测试构建里为桩(recreate 路径引用; 假设备
+// 不走真实 vtable 钩子组, 真 D3D9 部分也不依赖设备钩子 —— 只验恢复核心语义)。
+bool gmdx9_install_render_hooks(IDirect3DDevice9*) { return true; }
 
 static int g_pass = 0, g_fail = 0;
 #define CHECK(cond, name)                                                    \
@@ -180,6 +189,53 @@ int main()
         pub = nullptr;
     }
 
+    // ---------- 层 1b: 设备 Reset 前后回调时序 ----------
+    printf("-- 层1b Reset 前后回调 --\n");
+    {
+        // 具名函数保证重复注册传的是同一对指针(lambda 每个都是新函数, 测不了去重)
+        static int pre_calls = 0, post_calls = 0;
+        static int post_recreated_flags = 0;   // bit0: 见过 recreated=false; bit1: 见过 true
+        struct Cbs
+        {
+            static void pre(void) { ++pre_calls; }
+            static void post(bool recreated) { ++post_calls; post_recreated_flags |= recreated ? 2 : 1; }
+            static void pre_dup(void) { ++pre_calls; }             // 不同指针(去重测试的第二对)
+            static void post_dup(bool) { ++post_calls; }
+        };
+        reset_counters();
+        gmdx9_test_clear_state();
+        install_via_production(wnd, S_OK, FALSE);
+        int rc0 = gmdx9_register_reset_callback(&Cbs::pre, &Cbs::post);
+        CHECK(rc0 == 0, "T10a reset 回调注册成功");
+
+        // T10 成功 Reset: pre 先于 post, post 携带 recreated=false
+        pre_calls = post_calls = post_recreated_flags = 0;
+        g_tcl_val = S_OK;
+        g_rst_val = S_OK;
+        hr = ResetDevice(FakeDev(), nullptr);
+        CHECK(hr == S_OK && pre_calls == 1 && post_calls == 1, "T10b 成功 Reset: pre/post 各一次");
+        CHECK((post_recreated_flags & 1) && !(post_recreated_flags & 2),
+            "T10c 同设备 Reset 的 post 收到 recreated=false");
+
+        // T11 失败 Reset: pre 触发但不 post(资源保持已释放态等重试)
+        g_rst_val = E_FAIL;
+        hr = ResetDevice(FakeDev(), nullptr);
+        CHECK(hr == E_FAIL && pre_calls == 2 && post_calls == 1, "T11 失败 Reset: 只 pre 不 post");
+
+        // T12 LOST 早退: 不触发 pre(未到 Reset 环节)
+        g_tcl_val = D3DERR_DEVICELOST;
+        hr = ResetDevice(FakeDev(), nullptr);
+        CHECK(hr == D3DERR_DEVICELOST && pre_calls == 2 && post_calls == 1,
+            "T12 LOST 早退: pre/post 均不触发");
+
+        // T13 重复注册去重: 同一对回调二次注册不产生双触发
+        rc0 = gmdx9_register_reset_callback(&Cbs::pre, &Cbs::post);
+        CHECK(rc0 == 0, "T13a 同一对回调二次注册返回 0");
+        g_tcl_val = S_OK;
+        g_rst_val = S_OK;
+        hr = ResetDevice(FakeDev(), nullptr);
+        CHECK(hr == S_OK && pre_calls == 3 && post_calls == 2, "T13b 去重后仍单次触发");
+    }
     // ---------- 层 2: 真 D3D9 集成 ----------
     printf("-- 层2 真 D3D9 集成 --\n");
     gmdx9_test_clear_state();
@@ -277,6 +333,42 @@ int main()
             gm80_restore_reset_hook();
             CHECK(vt[16] == orig16, "R7 卸载后 vt[16] 恢复为原始真 Reset");
             gmdx9_test_clear_state();
+
+            // R8 GetVertexShader 引用语义(决定 inject.cpp SetVertexShader 钩子的 Release 纪律):
+            // 基线 c0 = 创建引用(1) + AddRef 返回; Set 不应加引用; Get 每次调用加一引用
+            // 则 c1 == c0 + 1。(GMGraphic 全部 Guard 按"Get 带 AddRef"写且实机不崩, 本用例实证。)
+            {
+                const char* vs_hlsl =
+                    "float4 main(float4 p : POSITION) : POSITION { return p; }";
+                ID3DXBuffer* code = nullptr;
+                HRESULT hc = D3DXCompileShader(vs_hlsl, (UINT)strlen(vs_hlsl),
+                    nullptr, nullptr, "main", "vs_1_1", 0, &code, nullptr, nullptr);
+                CHECK(hc == D3D_OK && code, "R8a 最小 vs_1_1 编译成功");
+                if (code)
+                {
+                    IDirect3DVertexShader9* vs = nullptr;
+                    HRESULT hv = dev->CreateVertexShader((const DWORD*)code->GetBufferPointer(), &vs);
+                    code->Release();
+                    CHECK(hv == D3D_OK && vs, "R8b CreateVertexShader 成功");
+                    if (vs)
+                    {
+                        ULONG c0 = vs->AddRef(); vs->Release();   // ≈1(创建)+1
+                        dev->SetVertexShader(vs);
+                        ULONG cS = vs->AddRef(); vs->Release();
+                        CHECK(cS == c0, "R8c SetVertexShader 不加引用");
+                        IDirect3DVertexShader9* got = nullptr;
+                        HRESULT hg = dev->GetVertexShader(&got);
+                        ULONG c1 = vs->AddRef(); vs->Release();
+                        CHECK(hg == D3D_OK && got == vs, "R8d GetVertexShader 返回绑定对象");
+                        bool get_addrefs = (c1 == c0 + 1);
+                        CHECK(get_addrefs, "R8e GetVertexShader 每次 Get 加一引用");
+                        // 归零清理: 解绑 + 创建引用 + (若 Get 加引用)Get 引用
+                        dev->SetVertexShader(nullptr);
+                        vs->Release();
+                        if (get_addrefs && got) got->Release();
+                    }
+                }
+            }
 
             if (dev2) dev2->Release();
             dev->Release();
