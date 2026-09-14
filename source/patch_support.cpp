@@ -45,3 +45,39 @@ void** gmdx9_ffp_vs_slot(int i)
 {
     return (i >= 0 && i < g_ffp_vs_slot_count) ? g_ffp_vs_slots[i] : nullptr;
 }
+
+// ---- 绘制前 flush 回调(自动合批保序, 2026-09-14) ----
+// 图集类插件(如 GMGraphic)把绘制攒在自己的顶点缓冲延迟提交, 与引擎原生绘制的即时
+// 提交混用时顺序会断(游戏侧手写 force_draw_to_screen 即为此而生)。插件经本注册口
+// 挂 flush 入口, inject.cpp 的八槽设备钩子在"绘制提交动作"(DrawPrimitive/
+// DrawIndexedPrimitive 含 UP 变体/Clear/SetRenderTarget/SetDepthStencilSurface/
+// EndScene)发生前调用 —— 顺序由机制保证, 游戏侧无需再写 flush。批对状态变更的
+// 免疫由 flush 侧的状态快照(GMGraphic 端 dssnap_*)保证, 因此状态类槽位不设钩。
+// 多注册者契约: 一次 fire_flush 按注册序逐个回调, 各自整批原子提交; 不同注册者
+// 批间的交错提交序(A1 B1 原生 A2 B2)在任何冲刷序下都不可复现, 这是"批=原子"
+// 模型的固有语义 —— 新的攒批系统应并入现有批(GMGraphic 图集批)而非自立注册者。
+static void (*g_flush_cbs[8])(void) = {};
+static int  g_flush_cb_count = 0;
+static bool g_flush_active = false;   // 回调执行中: 钩子直接透传(回调自身的设备调用不再触发)
+
+extern "C" __declspec(dllexport) int __cdecl gmdx9_register_flush_callback(void (*cb)(void))
+{
+    if (!cb) return -1;
+    for (int i = 0; i < g_flush_cb_count; i++)
+        if (g_flush_cbs[i] == cb) return 0;   // 已注册
+    if (g_flush_cb_count >= 8) return -1;
+    g_flush_cbs[g_flush_cb_count++] = cb;
+    return 0;
+}
+
+// 热路径纪律: 每个引擎绘制都会路过 —— 无注册或重入时一次判空返回。
+// 主线程纪律: GM8 单线程渲染, GMGraphic 的 shader worker 不绘制, 标志无需原子。
+void gmdx9_fire_flush(void)
+{
+    if (g_flush_cb_count <= 0 || g_flush_active) return;
+    g_flush_active = true;
+    const int n = g_flush_cb_count;   // 快照: 冲刷途中再注册不进本遍
+    for (int i = 0; i < n; i++)
+        g_flush_cbs[i]();
+    g_flush_active = false;
+}

@@ -1,4 +1,5 @@
 #include "d3d9_recovery.h"
+#include "main.h"
 #include <string.h>
 
 static D3DPRESENT_PARAMETERS
@@ -135,6 +136,9 @@ static void gmdx9_install_device_hooks(IDirect3DDevice9* dev)
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
     }
+    // [2026-09-14] 重建设备同样要装 SetTexture 白像素 + flush 钩子组
+    // (原先重建路径无钩, 白像素兜底静默失效; 现与 CreateDevice 共用安装器)。
+    gmdx9_install_render_hooks(dev);
 }
 
 static HRESULT gmdx9_recreate_device(void)

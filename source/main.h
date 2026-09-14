@@ -53,7 +53,9 @@ extern XMVECTOR vertex;
 extern HINSTANCE my_handle;
 bool gm80_apply_patches(void);
 void gm80_restore_reset_hook(void); // DLL 卸载时恢复 vtable Reset 钩子(2026-08-06)
-void gm80_restore_settexture_hook(void); // DLL 卸载时恢复 vtable SetTexture 钩子(2026-08-26)
+void gm80_restore_device_hooks(void); // DLL 卸载时恢复 vtable 钩子组: SetTexture(白像素)+flush 六槽(2026-09-14, 原 settexture 恢复扩展)
+bool gmdx9_install_render_hooks(IDirect3DDevice9* dev); // 设备 vtable 钩子组安装(CreateDevice 与 recovery 重建路径共用)
+void gmdx9_fire_flush(void); // 六槽钩子入口: 依次调用注册的插件 flush 回调(patch_support)
 
 HRESULT WINAPI SetVertexShader(IDirect3DDevice9* dev, DWORD fvf);
 DWORD gm_col_to_dx9(double color);

@@ -475,19 +475,161 @@ HRESULT WINAPI SetTexture_wrap(
 }
 
 // DLL 卸载时恢复 vt[65](dllmain DLL_PROCESS_DETACH 调用)。
-void gm80_restore_settexture_hook(void)
+// [2026-09-14] 并入 gmdx9_restore_device_hooks(全钩子组恢复), 本函数删除。
+
+// ---- [2026-09-14] 合批 flush 钩子(自动 force_draw_to_screen) ----
+// GMGraphic 等插件把绘制攒在自己的顶点缓冲延迟提交, 与引擎原生绘制的即时提交混用
+// 时顺序会断(rTitle 入场幕帘被末尾 flush 盖掉即实例)。插件经 gmdx9_register_flush_
+// callback 注册 flush 入口后, 下列"绘制提交动作"发生前自动先刷挂起批:
+//   DrawPrimitive / DrawIndexedPrimitive (含各自 UP 变体)
+//                       引擎/任何 DLL 的绘制提交(引擎全部原生绘制走 UP, 24 调用点;
+//                       indexed 两槽 GM8 生态零流量, 收齐使提交族定义性闭合)
+//   Clear               批先画后清(GML 顺序语义)
+//   SetRenderTarget / SetDepthStencilSurface   换目标前刷(批画给旧目标, surface_set_target)
+//   EndScene            帧尾兜底(批不过夜)
+// 批对状态变更的免疫由 flush 侧状态快照(GMGraphic dssnap_*)保证, 状态类槽位不设钩。
+// 重入纪律: gmdx9_fire_flush 执行期间 g_flush_active 为真, 本组钩子直接透传 —— 回调
+// 自己的 DrawPrimitiveUP、状态守卫恢复触发的 SetRenderTarget 都不会递归。
+
+static HRESULT(WINAPI* real_draw_primitive_up)(IDirect3DDevice9*, D3DPRIMITIVETYPE, UINT, const void*, UINT) = nullptr;
+static HRESULT(WINAPI* real_draw_primitive)(IDirect3DDevice9*, D3DPRIMITIVETYPE, UINT, UINT) = nullptr;
+static HRESULT(WINAPI* real_draw_indexed_primitive)(IDirect3DDevice9*, D3DPRIMITIVETYPE, INT, UINT, UINT, UINT, UINT) = nullptr;
+static HRESULT(WINAPI* real_draw_indexed_primitive_up)(IDirect3DDevice9*, D3DPRIMITIVETYPE, UINT, UINT, UINT, const void*, D3DFORMAT, const void*, UINT) = nullptr;
+static HRESULT(WINAPI* real_clear)(IDirect3DDevice9*, DWORD, const D3DRECT*, DWORD, D3DCOLOR, float, DWORD) = nullptr;
+static HRESULT(WINAPI* real_set_render_target_vt)(IDirect3DDevice9*, DWORD, IDirect3DSurface9*) = nullptr;
+static HRESULT(WINAPI* real_set_depth_stencil)(IDirect3DDevice9*, IDirect3DSurface9*) = nullptr;
+static HRESULT(WINAPI* real_end_scene)(IDirect3DDevice9*) = nullptr;
+
+HRESULT WINAPI DrawPrimitiveUP_hook(IDirect3DDevice9* dev, D3DPRIMITIVETYPE type,
+    UINT count, const void* data, UINT stride)
+{
+    gmdx9_fire_flush();
+    return real_draw_primitive_up(dev, type, count, data, stride);
+}
+
+HRESULT WINAPI DrawPrimitive_hook(IDirect3DDevice9* dev, D3DPRIMITIVETYPE type,
+    UINT count, UINT start)
+{
+    gmdx9_fire_flush();
+    return real_draw_primitive(dev, type, count, start);
+}
+
+HRESULT WINAPI DrawIndexedPrimitive_hook(IDirect3DDevice9* dev, D3DPRIMITIVETYPE type,
+    INT base_vertex, UINT min_index, UINT num_vertices, UINT start_index, UINT prim_count)
+{
+    gmdx9_fire_flush();
+    return real_draw_indexed_primitive(dev, type, base_vertex, min_index, num_vertices,
+        start_index, prim_count);
+}
+
+HRESULT WINAPI DrawIndexedPrimitiveUP_hook(IDirect3DDevice9* dev, D3DPRIMITIVETYPE type,
+    UINT min_index, UINT num_indices, UINT prim_count, const void* index_data,
+    D3DFORMAT index_format, const void* data, UINT stride)
+{
+    gmdx9_fire_flush();
+    return real_draw_indexed_primitive_up(dev, type, min_index, num_indices, prim_count,
+        index_data, index_format, data, stride);
+}
+
+HRESULT WINAPI Clear_hook(IDirect3DDevice9* dev, DWORD count, const D3DRECT* rects,
+    DWORD flags, D3DCOLOR color, float z, DWORD stencil)
+{
+    gmdx9_fire_flush();
+    return real_clear(dev, count, rects, flags, color, z, stencil);
+}
+
+// 名带 _vt: 与上方引擎调用点包装 SetRenderTarget(0x7C 站点重定向)区分。
+// 本钩在设备 vtable 槽 37, 连 surface_set_target 之外的直接调用也一并覆盖。
+HRESULT WINAPI SetRenderTarget_vt(IDirect3DDevice9* dev, DWORD index, IDirect3DSurface9* surface)
+{
+    gmdx9_fire_flush();
+    return real_set_render_target_vt(dev, index, surface);
+}
+
+HRESULT WINAPI SetDepthStencilSurface_hook(IDirect3DDevice9* dev, IDirect3DSurface9* surface)
+{
+    gmdx9_fire_flush();
+    return real_set_depth_stencil(dev, surface);
+}
+
+HRESULT WINAPI EndScene_hook(IDirect3DDevice9* dev)
+{
+    gmdx9_fire_flush();
+    return real_end_scene(dev);
+}
+
+// 钩子表: D3D9 设备 vtable 槽位号。已验证锚点(与既有补丁注释一致): Present=17(0x44)、
+// BeginScene=41(0xA4)、EndScene=42(0xA8)、Clear=43(0xAC)、SetTransform=44(0xB0)、
+// SetTexture=65(0x104)、DrawPrimitiveUP=83(0x14C); SetRenderTarget=37(0x94)/
+// SetDepthStencilSurface=39(0x9C)/DrawPrimitive=81(0x144) 按同段连续序反推;
+// DrawIndexedPrimitive=82(0x148)/DrawIndexedPrimitiveUP=84(0x150) 由 d3d9.h 全表
+// 119 方法枚举核定(与上述全部锚点吻合)。SetVertexShader=92(0x170), 补丁表里的
+// 0x130 是它的 D3D8 源槽, 勿当 D3D9 槽位引用。
+struct VtHook
+{
+    int slot;
+    void* wrap;
+    void** real;
+};
+
+static VtHook g_vt_hooks[] = {
+    { 65, (void*)&SetTexture_wrap,             (void**)&real_set_texture },
+    { 83, (void*)&DrawPrimitiveUP_hook,        (void**)&real_draw_primitive_up },
+    { 81, (void*)&DrawPrimitive_hook,          (void**)&real_draw_primitive },
+    { 82, (void*)&DrawIndexedPrimitive_hook,   (void**)&real_draw_indexed_primitive },
+    { 84, (void*)&DrawIndexedPrimitiveUP_hook, (void**)&real_draw_indexed_primitive_up },
+    { 43, (void*)&Clear_hook,                  (void**)&real_clear },
+    { 37, (void*)&SetRenderTarget_vt,          (void**)&real_set_render_target_vt },
+    { 39, (void*)&SetDepthStencilSurface_hook, (void**)&real_set_depth_stencil },
+    { 42, (void*)&EndScene_hook,               (void**)&real_end_scene },
+};
+
+// 设备 vtable 钩子组安装: CreateDevice 成功块与 recovery 重建路径共用。
+// 真指针只需首次保存 —— 所有设备对象共享同一驱动实现地址(同 SetTexture 钩子先例)。
+bool gmdx9_install_render_hooks(IDirect3DDevice9* dev)
+{
+    __try
+    {
+        void** vt = *(void***)dev;
+        for (int i = 0; i < (int)(sizeof(g_vt_hooks) / sizeof(g_vt_hooks[0])); i++)
+        {
+            if (*g_vt_hooks[i].real == nullptr)
+                *g_vt_hooks[i].real = vt[g_vt_hooks[i].slot];
+            DWORD oldp;
+            if (VirtualProtect(&vt[g_vt_hooks[i].slot], sizeof(void*),
+                    PAGE_EXECUTE_READWRITE, &oldp))
+            {
+                vt[g_vt_hooks[i].slot] = g_vt_hooks[i].wrap;
+                VirtualProtect(&vt[g_vt_hooks[i].slot], sizeof(void*), oldp, &oldp);
+            }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+    return true;
+}
+
+// DLL 卸载时恢复全部设备 vtable 钩子(原 SetTexture 恢复扩展, 2026-09-14)。
+void gm80_restore_device_hooks(void)
 {
     __try
     {
         IDirect3DDevice9* dev = Device;   // runner 全局 0x58d388
-        if (!dev || !real_set_texture) return;
+        if (!dev) return;
         void** vt = *(void***)dev;
-        if (!vt || vt[65] != (void*)&SetTexture_wrap) return; // 钩子已被别处改过 → 不碰
-        DWORD oldp;
-        if (VirtualProtect(&vt[65], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldp))
+        for (int i = 0; i < (int)(sizeof(g_vt_hooks) / sizeof(g_vt_hooks[0])); i++)
         {
-            vt[65] = (void*)real_set_texture;
-            VirtualProtect(&vt[65], sizeof(void*), oldp, &oldp);
+            if (*g_vt_hooks[i].real == nullptr) continue;
+            if (vt[g_vt_hooks[i].slot] != g_vt_hooks[i].wrap) continue; // 被别处改过 → 不碰
+            DWORD oldp;
+            if (VirtualProtect(&vt[g_vt_hooks[i].slot], sizeof(void*),
+                    PAGE_EXECUTE_READWRITE, &oldp))
+            {
+                vt[g_vt_hooks[i].slot] = *g_vt_hooks[i].real;
+                VirtualProtect(&vt[g_vt_hooks[i].slot], sizeof(void*), oldp, &oldp);
+            }
         }
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
@@ -566,21 +708,9 @@ HRESULT WINAPI CreateDevice(IDirect3D9* d3d9, UINT Adapter, D3DDEVTYPE DeviceTyp
         // 设备丢失恢复核心(d3d9_recovery.cpp): 保存干净 pp9/创建参数 + 安装 Reset 钩子
         gmdx9_recovery_on_device_created(*ppReturnedDeviceInterface, &pp9,
             Adapter, DeviceType, hFocusWindow, bf_used);
-        // [2026-08-26] SetTexture 白像素兜底钩子(vt[65]=0x104): 每个新设备对象都要重装。
-        // 真指针只需首次保存 —— 所有设备对象共享同一驱动实现地址。注: recovery 整设备
-        // 重建走直建路径不经本包装, 该新设备无此钩子(兜底静默失效, 不崩溃)。
-        {
-            void** dvt = *(void***)(*ppReturnedDeviceInterface);
-            DWORD oldp3;
-            if (!real_set_texture)
-                real_set_texture = (HRESULT(WINAPI*)(IDirect3DDevice9*, DWORD,
-                    IDirect3DBaseTexture9*))dvt[65];
-            if (VirtualProtect(&dvt[65], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldp3))
-            {
-                dvt[65] = (void*)&SetTexture_wrap;
-                VirtualProtect(&dvt[65], sizeof(void*), oldp3, &oldp3);
-            }
-        }
+        // [2026-08-26] SetTexture 白像素兜底钩子(vt[65]) + [2026-09-14] flush 六槽钩子:
+        // 每个新设备对象都要重装; recovery 重建路径的 gmdx9_install_device_hooks 同调。
+        gmdx9_install_render_hooks(*ppReturnedDeviceInterface);
         // CheckDeviceMultiSampleType 接管: D3D 对象 vtable 槽 0x2C → 包装(补 pQualityLevels)。
         if (!real_check_ms)
         {
