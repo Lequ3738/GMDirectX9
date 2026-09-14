@@ -310,6 +310,9 @@ static bool is_passthrough_vs(IDirect3DVertexShader9* vs)
 
 HRESULT WINAPI SetVertexShader(IDirect3DDevice9* dev, DWORD fvf)
 {
+    // [2026-09-14 二批] 引擎每绘制的 SetVertexShader(FVF) 调用点包装 —— 兼任 flush:
+    // 本包装不落 vtable 92(内部转 SetVertexDeclaration/SetFVF/整绑), 需在此先刷挂起批。
+    gmdx9_fire_flush();
     IDirect3DVertexShader9* vs = nullptr;
     if (SUCCEEDED(dev->GetVertexShader(&vs)) && vs != nullptr)
     {
@@ -461,6 +464,9 @@ static void ensure_white_pixel(IDirect3DDevice9* dev)
 HRESULT WINAPI SetTexture_wrap(
     IDirect3DDevice9* dev, DWORD Stage, IDirect3DBaseTexture9* pTexture)
 {
+    // [2026-09-14 二批] 兼任 flush 钩(槽 65): 纹理绑定是批继承态, 引擎逐绘制的
+    // SetTexture 原本让位于 DrawUP 钩冲刷, 现提前到此处 —— 净冲刷次数不变。
+    gmdx9_fire_flush();
     if (Stage == 0 && pTexture == nullptr)
     {
         IDirect3DPixelShader9* ps = nullptr;
@@ -480,14 +486,44 @@ HRESULT WINAPI SetTexture_wrap(
 // ---- [2026-09-14] 合批 flush 钩子(自动 force_draw_to_screen) ----
 // GMGraphic 等插件把绘制攒在自己的顶点缓冲延迟提交, 与引擎原生绘制的即时提交混用
 // 时顺序会断(rTitle 入场幕帘被末尾 flush 盖掉即实例)。插件经 gmdx9_register_flush_
-// callback 注册 flush 入口后, 下列"绘制提交动作"发生前自动先刷挂起批:
-//   DrawPrimitive / DrawIndexedPrimitive (含各自 UP 变体)
-//                       引擎/任何 DLL 的绘制提交(引擎全部原生绘制走 UP, 24 调用点;
-//                       indexed 两槽 GM8 生态零流量, 收齐使提交族定义性闭合)
-//   Clear               批先画后清(GML 顺序语义)
-//   SetRenderTarget / SetDepthStencilSurface   换目标前刷(批画给旧目标, surface_set_target)
-//   EndScene            帧尾兜底(批不过夜)
-// 批对状态变更的免疫由 flush 侧状态快照(GMGraphic dssnap_*)保证, 状态类槽位不设钩。
+// callback 注册 flush 入口后, 下列设备调用发生前自动先刷挂起批。
+//
+// 不变式(字面闭合): 任何提交像素、写入纹理内容、读取像素或改变绘制状态的设备调用
+// 都先冲刷。批内容按批打开时刻的状态渲染, 所以状态写入不切段 = 批内后段内容被
+// 冻结成旧值(地图图标丢 d3d_transform、psDissolution uniform 被 SDF 常量污染即实例)。
+//
+//   提交/内容族  DrawPrimitive / DrawIndexedPrimitive(含各自 UP 变体) / Clear /
+//                ProcessVertices / DrawRectPatch / DrawTriPatch / ColorFill /
+//                StretchRect / UpdateSurface / UpdateTexture /
+//                GetRenderTargetData / GetFrontBufferData(读回=截图)
+//   目标族       SetRenderTarget / SetDepthStencilSurface
+//                (批画给旧目标; EndScene 帧尾兜底, 批不过夜)
+//   状态族       SetTransform / MultiplyTransform / SetViewport / SetScissorRect /
+//                SetRenderState / SetTextureStageState / SetSamplerState /
+//                SetVertexDeclaration / SetFVF / SetVertexShader(92) /
+//                SetTexture(65) / SetStreamSource(±Freq) / SetIndices /
+//                SetVertexShaderConstantF/I/B / SetPixelShaderConstantF/I/B /
+//                SetMaterial / SetLight / LightEnable / SetClipPlane /
+//                SetSoftwareVertexProcessing
+//
+// 引擎路径覆盖: 8.0 的 D3D8→D3D9 槽位重映射后, 引擎状态调用直通设备 vtable,
+// 状态族钩子天然捕获; 每绘制的 SetVertexShader(FVF) 走调用点包装(下方
+// SetVertexShader), 其内的 SetVertexDeclaration/SetFVF/SetVertexShader 落 vtable
+// 被钩 —— 三连(SetTexture→SetVertexShader→DrawUP)的冲刷从 DrawUP 提前到
+// SetTexture, 净冲刷次数不变。空批两比较早退; flush 侧 dssnap 状态恢复的
+// 数十次设备写由 g_flush_active 挡住, 不递归。
+//
+// 不钩清单(契约, 非"游戏够用"而是按性质排除):
+//   Get*/Create*/ValidateDevice/CreateQuery   只读与资源创建, 无状态无顺序
+//   Present              GM8 每帧必经 EndScene(42), 传递覆盖
+//   Reset                设备丢失重建, 批随设备灭, flush 无意义(recovery 路径另处理)
+//   SetGammaRamp         扫描输出期整帧套用, 与绘制顺序无交互
+//   SetCursorProperties/Position/ShowCursor   系统光标覆盖层, 非管线状态
+//   SetPaletteEntries/SetCurrentTexturePalette   P8 调色板纹理, 本层不创建
+//   SetNPatchMode        只影响补面细分, 而补面绘制(DrawRect/TriPatch)自身已钩
+//   DeletePatch          资源销毁, 非状态非绘制
+//   StateBlock 三方法    录制/Apply 走 state-block 对象 vtable, 设备钩天然盲区;
+//                        本层不使用 state block, 使用者自负
 // 重入纪律: gmdx9_fire_flush 执行期间 g_flush_active 为真, 本组钩子直接透传 —— 回调
 // 自己的 DrawPrimitiveUP、状态守卫恢复触发的 SetRenderTarget 都不会递归。
 
@@ -558,6 +594,126 @@ HRESULT WINAPI EndScene_hook(IDirect3DDevice9* dev)
     return real_end_scene(dev);
 }
 
+// ---- [2026-09-14 二批] 状态/内容族 flush 钩子 ----
+// 全部同构: gmdx9_fire_flush() 后透传。槽位号由 d3d9.h 全表 119 方法枚举核定
+// (与上方全部既有锚点吻合)。_vt 后缀 = 与既有引擎调用点翻译函数(D3D8 旧签名)
+// 撞名, vtable 版加缀区分。
+
+// 提交/内容族: 纹理内容更新与像素读写也参与顺序 —— 先画的批应见旧内容,
+// 截图(GetFrontBufferData/GetRenderTargetData)必须包含已画批。
+static HRESULT(WINAPI* real_update_surface)(IDirect3DDevice9*, IDirect3DSurface9*, const RECT*, IDirect3DSurface9*, const RECT*) = nullptr;
+static HRESULT(WINAPI* real_update_texture)(IDirect3DDevice9*, IDirect3DBaseTexture9*, IDirect3DBaseTexture9*) = nullptr;
+static HRESULT(WINAPI* real_get_render_target_data)(IDirect3DDevice9*, IDirect3DSurface9*, IDirect3DSurface9*) = nullptr;
+static HRESULT(WINAPI* real_get_front_buffer_data)(IDirect3DDevice9*, UINT, IDirect3DSurface9*) = nullptr;
+static HRESULT(WINAPI* real_stretch_rect)(IDirect3DDevice9*, IDirect3DSurface9*, const RECT*, IDirect3DSurface9*, const RECT*, D3DTEXTUREFILTERTYPE) = nullptr;
+static HRESULT(WINAPI* real_color_fill)(IDirect3DDevice9*, IDirect3DSurface9*, const RECT*, D3DCOLOR) = nullptr;
+static HRESULT(WINAPI* real_process_vertices)(IDirect3DDevice9*, UINT, UINT, UINT, IDirect3DVertexBuffer9*, IDirect3DVertexDeclaration9*, DWORD) = nullptr;
+static HRESULT(WINAPI* real_draw_rect_patch)(IDirect3DDevice9*, UINT, const float*, const D3DRECTPATCH_INFO*) = nullptr;
+static HRESULT(WINAPI* real_draw_tri_patch)(IDirect3DDevice9*, UINT, const float*, const D3DTRIPATCH_INFO*) = nullptr;
+
+HRESULT WINAPI UpdateSurface_hook(IDirect3DDevice9* dev, IDirect3DSurface9* src, const RECT* src_rect, IDirect3DSurface9* dst, const RECT* dst_rect)
+{ gmdx9_fire_flush(); return real_update_surface(dev, src, src_rect, dst, dst_rect); }
+HRESULT WINAPI UpdateTexture_hook(IDirect3DDevice9* dev, IDirect3DBaseTexture9* src, IDirect3DBaseTexture9* dst)
+{ gmdx9_fire_flush(); return real_update_texture(dev, src, dst); }
+HRESULT WINAPI GetRenderTargetData_hook(IDirect3DDevice9* dev, IDirect3DSurface9* rt, IDirect3DSurface9* dst)
+{ gmdx9_fire_flush(); return real_get_render_target_data(dev, rt, dst); }
+HRESULT WINAPI GetFrontBufferData_hook(IDirect3DDevice9* dev, UINT swap_chain, IDirect3DSurface9* dst)
+{ gmdx9_fire_flush(); return real_get_front_buffer_data(dev, swap_chain, dst); }
+HRESULT WINAPI StretchRect_hook(IDirect3DDevice9* dev, IDirect3DSurface9* src, const RECT* src_rect, IDirect3DSurface9* dst, const RECT* dst_rect, D3DTEXTUREFILTERTYPE filter)
+{ gmdx9_fire_flush(); return real_stretch_rect(dev, src, src_rect, dst, dst_rect, filter); }
+HRESULT WINAPI ColorFill_hook(IDirect3DDevice9* dev, IDirect3DSurface9* surface, const RECT* rect, D3DCOLOR color)
+{ gmdx9_fire_flush(); return real_color_fill(dev, surface, rect, color); }
+HRESULT WINAPI ProcessVertices_hook(IDirect3DDevice9* dev, UINT src_start, UINT dest_index, UINT vertex_count, IDirect3DVertexBuffer9* dest_buffer, IDirect3DVertexDeclaration9* decl, DWORD flags)
+{ gmdx9_fire_flush(); return real_process_vertices(dev, src_start, dest_index, vertex_count, dest_buffer, decl, flags); }
+HRESULT WINAPI DrawRectPatch_hook(IDirect3DDevice9* dev, UINT handle, const float* num_segs, const D3DRECTPATCH_INFO* info)
+{ gmdx9_fire_flush(); return real_draw_rect_patch(dev, handle, num_segs, info); }
+HRESULT WINAPI DrawTriPatch_hook(IDirect3DDevice9* dev, UINT handle, const float* num_segs, const D3DTRIPATCH_INFO* info)
+{ gmdx9_fire_flush(); return real_draw_tri_patch(dev, handle, num_segs, info); }
+
+// 变换/视口/剪裁族: d3d_transform_*(引擎写 WORLD)、视图正交/视口切换。
+static HRESULT(WINAPI* real_set_transform)(IDirect3DDevice9*, DWORD, const D3DMATRIX*) = nullptr;
+static HRESULT(WINAPI* real_multiply_transform)(IDirect3DDevice9*, DWORD, const D3DMATRIX*) = nullptr;
+static HRESULT(WINAPI* real_set_viewport_vt)(IDirect3DDevice9*, const D3DVIEWPORT9*) = nullptr;
+static HRESULT(WINAPI* real_set_scissor_rect)(IDirect3DDevice9*, const RECT*) = nullptr;
+
+HRESULT WINAPI SetTransform_hook(IDirect3DDevice9* dev, DWORD state, const D3DMATRIX* matrix)
+{ gmdx9_fire_flush(); return real_set_transform(dev, state, matrix); }
+HRESULT WINAPI MultiplyTransform_hook(IDirect3DDevice9* dev, DWORD state, const D3DMATRIX* matrix)
+{ gmdx9_fire_flush(); return real_multiply_transform(dev, state, matrix); }
+// 名带 _vt: 引擎调用点包装 SetViewport_inj(D3D8 旧签名)已存在, 最终落本钩。
+HRESULT WINAPI SetViewport_vt(IDirect3DDevice9* dev, const D3DVIEWPORT9* viewport)
+{ gmdx9_fire_flush(); return real_set_viewport_vt(dev, viewport); }
+HRESULT WINAPI SetScissorRect_hook(IDirect3DDevice9* dev, const RECT* rect)
+{ gmdx9_fire_flush(); return real_set_scissor_rect(dev, rect); }
+
+// 状态族: 渲染状态/采样/纹理阶段 + 着色器与常量 + 顶点格式与流 + 灯光材质。
+static HRESULT(WINAPI* real_set_render_state)(IDirect3DDevice9*, DWORD, DWORD) = nullptr;
+static HRESULT(WINAPI* real_set_texture_stage_state)(IDirect3DDevice9*, DWORD, DWORD, DWORD) = nullptr;
+static HRESULT(WINAPI* real_set_sampler_state)(IDirect3DDevice9*, DWORD, DWORD, DWORD) = nullptr;
+static HRESULT(WINAPI* real_set_vertex_declaration)(IDirect3DDevice9*, IDirect3DVertexDeclaration9*) = nullptr;
+static HRESULT(WINAPI* real_set_fvf)(IDirect3DDevice9*, DWORD) = nullptr;
+static HRESULT(WINAPI* real_set_vertex_shader_vt)(IDirect3DDevice9*, IDirect3DVertexShader9*) = nullptr;
+static HRESULT(WINAPI* real_set_pixel_shader)(IDirect3DDevice9*, IDirect3DPixelShader9*) = nullptr;
+static HRESULT(WINAPI* real_set_vs_constant_f)(IDirect3DDevice9*, UINT, const float*, UINT) = nullptr;
+static HRESULT(WINAPI* real_set_vs_constant_i)(IDirect3DDevice9*, UINT, const int*, UINT) = nullptr;
+static HRESULT(WINAPI* real_set_vs_constant_b)(IDirect3DDevice9*, UINT, const BOOL*, UINT) = nullptr;
+static HRESULT(WINAPI* real_set_ps_constant_f)(IDirect3DDevice9*, UINT, const float*, UINT) = nullptr;
+static HRESULT(WINAPI* real_set_ps_constant_i)(IDirect3DDevice9*, UINT, const int*, UINT) = nullptr;
+static HRESULT(WINAPI* real_set_ps_constant_b)(IDirect3DDevice9*, UINT, const BOOL*, UINT) = nullptr;
+static HRESULT(WINAPI* real_set_stream_source_vt)(IDirect3DDevice9*, UINT, IDirect3DVertexBuffer9*, UINT, UINT) = nullptr;
+static HRESULT(WINAPI* real_set_stream_source_freq)(IDirect3DDevice9*, UINT, UINT) = nullptr;
+static HRESULT(WINAPI* real_set_indices)(IDirect3DDevice9*, IDirect3DIndexBuffer9*) = nullptr;
+static HRESULT(WINAPI* real_set_material)(IDirect3DDevice9*, const D3DMATERIAL9*) = nullptr;
+static HRESULT(WINAPI* real_set_light)(IDirect3DDevice9*, DWORD, const D3DLIGHT9*) = nullptr;
+static HRESULT(WINAPI* real_light_enable)(IDirect3DDevice9*, DWORD, BOOL) = nullptr;
+static HRESULT(WINAPI* real_set_clip_plane)(IDirect3DDevice9*, DWORD, const float*) = nullptr;
+static HRESULT(WINAPI* real_set_sw_vertex_processing)(IDirect3DDevice9*, BOOL) = nullptr;
+
+HRESULT WINAPI SetRenderState_hook(IDirect3DDevice9* dev, DWORD state, DWORD value)
+{ gmdx9_fire_flush(); return real_set_render_state(dev, state, value); }
+HRESULT WINAPI SetTextureStageState_hook(IDirect3DDevice9* dev, DWORD stage, DWORD type, DWORD value)
+{ gmdx9_fire_flush(); return real_set_texture_stage_state(dev, stage, type, value); }
+HRESULT WINAPI SetSamplerState_hook(IDirect3DDevice9* dev, DWORD sampler, DWORD type, DWORD value)
+{ gmdx9_fire_flush(); return real_set_sampler_state(dev, sampler, type, value); }
+HRESULT WINAPI SetVertexDeclaration_hook(IDirect3DDevice9* dev, IDirect3DVertexDeclaration9* decl)
+{ gmdx9_fire_flush(); return real_set_vertex_declaration(dev, decl); }
+HRESULT WINAPI SetFVF_hook(IDirect3DDevice9* dev, DWORD fvf)
+{ gmdx9_fire_flush(); return real_set_fvf(dev, fvf); }
+// 名带 _vt: 引擎调用点包装 SetVertexShader(FVF 旧签名)已存在, 本钩覆盖 vtable 直呼。
+HRESULT WINAPI SetVertexShader_vt(IDirect3DDevice9* dev, IDirect3DVertexShader9* vs)
+{ gmdx9_fire_flush(); return real_set_vertex_shader_vt(dev, vs); }
+HRESULT WINAPI SetPixelShader_hook(IDirect3DDevice9* dev, IDirect3DPixelShader9* ps)
+{ gmdx9_fire_flush(); return real_set_pixel_shader(dev, ps); }
+HRESULT WINAPI SetVertexShaderConstantF_hook(IDirect3DDevice9* dev, UINT start, const float* data, UINT count)
+{ gmdx9_fire_flush(); return real_set_vs_constant_f(dev, start, data, count); }
+HRESULT WINAPI SetVertexShaderConstantI_hook(IDirect3DDevice9* dev, UINT start, const int* data, UINT count)
+{ gmdx9_fire_flush(); return real_set_vs_constant_i(dev, start, data, count); }
+HRESULT WINAPI SetVertexShaderConstantB_hook(IDirect3DDevice9* dev, UINT start, const BOOL* data, UINT count)
+{ gmdx9_fire_flush(); return real_set_vs_constant_b(dev, start, data, count); }
+HRESULT WINAPI SetPixelShaderConstantF_hook(IDirect3DDevice9* dev, UINT start, const float* data, UINT count)
+{ gmdx9_fire_flush(); return real_set_ps_constant_f(dev, start, data, count); }
+HRESULT WINAPI SetPixelShaderConstantI_hook(IDirect3DDevice9* dev, UINT start, const int* data, UINT count)
+{ gmdx9_fire_flush(); return real_set_ps_constant_i(dev, start, data, count); }
+HRESULT WINAPI SetPixelShaderConstantB_hook(IDirect3DDevice9* dev, UINT start, const BOOL* data, UINT count)
+{ gmdx9_fire_flush(); return real_set_ps_constant_b(dev, start, data, count); }
+// 名带 _vt: D3D8→9 翻译函数 SetStreamSource(4 参旧签名)已存在, 本钩为 5 参 vtable 版。
+HRESULT WINAPI SetStreamSource_vt(IDirect3DDevice9* dev, UINT number, IDirect3DVertexBuffer9* buffer, UINT offset, UINT stride)
+{ gmdx9_fire_flush(); return real_set_stream_source_vt(dev, number, buffer, offset, stride); }
+HRESULT WINAPI SetStreamSourceFreq_hook(IDirect3DDevice9* dev, UINT number, UINT divider)
+{ gmdx9_fire_flush(); return real_set_stream_source_freq(dev, number, divider); }
+HRESULT WINAPI SetIndices_hook(IDirect3DDevice9* dev, IDirect3DIndexBuffer9* indices)
+{ gmdx9_fire_flush(); return real_set_indices(dev, indices); }
+HRESULT WINAPI SetMaterial_hook(IDirect3DDevice9* dev, const D3DMATERIAL9* material)
+{ gmdx9_fire_flush(); return real_set_material(dev, material); }
+HRESULT WINAPI SetLight_hook(IDirect3DDevice9* dev, DWORD index, const D3DLIGHT9* light)
+{ gmdx9_fire_flush(); return real_set_light(dev, index, light); }
+HRESULT WINAPI LightEnable_hook(IDirect3DDevice9* dev, DWORD index, BOOL enable)
+{ gmdx9_fire_flush(); return real_light_enable(dev, index, enable); }
+HRESULT WINAPI SetClipPlane_hook(IDirect3DDevice9* dev, DWORD index, const float* plane)
+{ gmdx9_fire_flush(); return real_set_clip_plane(dev, index, plane); }
+HRESULT WINAPI SetSoftwareVertexProcessing_hook(IDirect3DDevice9* dev, BOOL software)
+{ gmdx9_fire_flush(); return real_set_sw_vertex_processing(dev, software); }
+
 // 钩子表: D3D9 设备 vtable 槽位号。已验证锚点(与既有补丁注释一致): Present=17(0x44)、
 // BeginScene=41(0xA4)、EndScene=42(0xA8)、Clear=43(0xAC)、SetTransform=44(0xB0)、
 // SetTexture=65(0x104)、DrawPrimitiveUP=83(0x14C); SetRenderTarget=37(0x94)/
@@ -565,6 +721,9 @@ HRESULT WINAPI EndScene_hook(IDirect3DDevice9* dev)
 // DrawIndexedPrimitive=82(0x148)/DrawIndexedPrimitiveUP=84(0x150) 由 d3d9.h 全表
 // 119 方法枚举核定(与上述全部锚点吻合)。SetVertexShader=92(0x170), 补丁表里的
 // 0x130 是它的 D3D8 源槽, 勿当 D3D9 槽位引用。
+// [2026-09-14 二批] 二批全部新增槽位(30-35/44/46/47/49/51/53/55/57/67/69/75/77/85/
+// 87/89/92/94/96/98/100/102/104/107/109/111/113/115/116)由同一次全表枚举直接读出,
+// 与上述锚点同源。
 struct VtHook
 {
     int slot;
@@ -582,6 +741,43 @@ static VtHook g_vt_hooks[] = {
     { 37, (void*)&SetRenderTarget_vt,          (void**)&real_set_render_target_vt },
     { 39, (void*)&SetDepthStencilSurface_hook, (void**)&real_set_depth_stencil },
     { 42, (void*)&EndScene_hook,               (void**)&real_end_scene },
+    // 提交/内容族
+    { 30, (void*)&UpdateSurface_hook,          (void**)&real_update_surface },
+    { 31, (void*)&UpdateTexture_hook,          (void**)&real_update_texture },
+    { 32, (void*)&GetRenderTargetData_hook,    (void**)&real_get_render_target_data },
+    { 33, (void*)&GetFrontBufferData_hook,     (void**)&real_get_front_buffer_data },
+    { 34, (void*)&StretchRect_hook,            (void**)&real_stretch_rect },
+    { 35, (void*)&ColorFill_hook,              (void**)&real_color_fill },
+    { 85, (void*)&ProcessVertices_hook,        (void**)&real_process_vertices },
+    { 115, (void*)&DrawRectPatch_hook,         (void**)&real_draw_rect_patch },
+    { 116, (void*)&DrawTriPatch_hook,          (void**)&real_draw_tri_patch },
+    // 变换/视口/剪裁族
+    { 44, (void*)&SetTransform_hook,           (void**)&real_set_transform },
+    { 46, (void*)&MultiplyTransform_hook,      (void**)&real_multiply_transform },
+    { 47, (void*)&SetViewport_vt,              (void**)&real_set_viewport_vt },
+    { 75, (void*)&SetScissorRect_hook,         (void**)&real_set_scissor_rect },
+    // 状态族
+    { 57, (void*)&SetRenderState_hook,         (void**)&real_set_render_state },
+    { 67, (void*)&SetTextureStageState_hook,   (void**)&real_set_texture_stage_state },
+    { 69, (void*)&SetSamplerState_hook,        (void**)&real_set_sampler_state },
+    { 87, (void*)&SetVertexDeclaration_hook,   (void**)&real_set_vertex_declaration },
+    { 89, (void*)&SetFVF_hook,                 (void**)&real_set_fvf },
+    { 92, (void*)&SetVertexShader_vt,          (void**)&real_set_vertex_shader_vt },
+    { 107, (void*)&SetPixelShader_hook,        (void**)&real_set_pixel_shader },
+    { 94, (void*)&SetVertexShaderConstantF_hook, (void**)&real_set_vs_constant_f },
+    { 96, (void*)&SetVertexShaderConstantI_hook, (void**)&real_set_vs_constant_i },
+    { 98, (void*)&SetVertexShaderConstantB_hook, (void**)&real_set_vs_constant_b },
+    { 109, (void*)&SetPixelShaderConstantF_hook, (void**)&real_set_ps_constant_f },
+    { 111, (void*)&SetPixelShaderConstantI_hook, (void**)&real_set_ps_constant_i },
+    { 113, (void*)&SetPixelShaderConstantB_hook, (void**)&real_set_ps_constant_b },
+    { 100, (void*)&SetStreamSource_vt,         (void**)&real_set_stream_source_vt },
+    { 102, (void*)&SetStreamSourceFreq_hook,   (void**)&real_set_stream_source_freq },
+    { 104, (void*)&SetIndices_hook,            (void**)&real_set_indices },
+    { 49, (void*)&SetMaterial_hook,            (void**)&real_set_material },
+    { 51, (void*)&SetLight_hook,               (void**)&real_set_light },
+    { 53, (void*)&LightEnable_hook,            (void**)&real_light_enable },
+    { 55, (void*)&SetClipPlane_hook,           (void**)&real_set_clip_plane },
+    { 77, (void*)&SetSoftwareVertexProcessing_hook, (void**)&real_set_sw_vertex_processing },
 };
 
 // 设备 vtable 钩子组安装: CreateDevice 成功块与 recovery 重建路径共用。

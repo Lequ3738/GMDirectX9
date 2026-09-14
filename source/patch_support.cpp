@@ -49,10 +49,15 @@ void** gmdx9_ffp_vs_slot(int i)
 // ---- 绘制前 flush 回调(自动合批保序, 2026-09-14) ----
 // 图集类插件(如 GMGraphic)把绘制攒在自己的顶点缓冲延迟提交, 与引擎原生绘制的即时
 // 提交混用时顺序会断(游戏侧手写 force_draw_to_screen 即为此而生)。插件经本注册口
-// 挂 flush 入口, inject.cpp 的八槽设备钩子在"绘制提交动作"(DrawPrimitive/
-// DrawIndexedPrimitive 含 UP 变体/Clear/SetRenderTarget/SetDepthStencilSurface/
-// EndScene)发生前调用 —— 顺序由机制保证, 游戏侧无需再写 flush。批对状态变更的
-// 免疫由 flush 侧的状态快照(GMGraphic 端 dssnap_*)保证, 因此状态类槽位不设钩。
+// 挂 flush 入口, inject.cpp 的设备钩子在下列动作发生前调用:
+//   提交/内容族(绘制提交、Clear、纹理内容更新、ColorFill、StretchRect、读回截图)、
+//   目标族(SetRenderTarget/SetDepthStencilSurface)、
+//   状态族(变换/视口/剪裁/渲染状态/采样/着色器与常量/顶点格式与流/灯光材质)。
+// [2026-09-14 二批] 由"只钩提交动作+状态快照免疫"扩为字面闭合: 批内容按批打开
+// 时刻的状态渲染, 状态写入不切段会把批内后段冻结成旧值 —— 因此全部状态写入槽
+// 设钩切段; 状态快照(dssnap)降为纵深防御(防 state block 等钩外路径)。
+// 不钩清单与理由见 inject.cpp flush 钩子注释块(Get*/Present 传递/Reset/GammaRamp/
+// 光标/调色板/NPatch/DeletePatch; StateBlock 三方法走对象 vtable = 机制盲区)。
 // 多注册者契约: 一次 fire_flush 按注册序逐个回调, 各自整批原子提交; 不同注册者
 // 批间的交错提交序(A1 B1 原生 A2 B2)在任何冲刷序下都不可复现, 这是"批=原子"
 // 模型的固有语义 —— 新的攒批系统应并入现有批(GMGraphic 图集批)而非自立注册者。
