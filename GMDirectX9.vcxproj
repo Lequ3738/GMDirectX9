@@ -77,6 +77,7 @@
     <ClInclude Include="pch.h" />
     <ClInclude Include="source\d3d9_recovery.h" />
     <ClInclude Include="source\main.h" />
+    <ClInclude Include="source\state_shadow.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="dllmain.cpp" />
@@ -84,6 +85,7 @@
     <ClCompile Include="source\d3d9_recovery.cpp" />
     <ClCompile Include="source\patch_support.cpp" />
     <ClCompile Include="source\inject.cpp" />
+    <ClCompile Include="source\state_shadow.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

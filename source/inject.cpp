@@ -1,5 +1,6 @@
 ﻿#include "main.h"
 #include "d3d9_recovery.h"
+#include "state_shadow.h"
 
 extern IDirect3DTexture9* white_pixel = nullptr;
 extern D3DPRESENT_PARAMETERS* present_params;
@@ -199,13 +200,17 @@ static HRESULT gm80_ensure_fake_ffp_vs_shape(IDirect3DDevice9* dev)
 }
 
 // 刷新仿固定管线 VS 的 WVP 常量。钩子在 DrawPrimitiveUP 前触发,
-// 此刻引擎本绘制所需的 SetTransform 已全部完成, GetTransform 必为当前值。
+// 此刻引擎本绘制所需的 SetTransform 已全部完成, 当前值必为所需值。
+// [2026-09-14 修复③] 三矩阵经影子表读取(零设备调用); 影子未就绪退回真 GetTransform。
 static HRESULT gm80_update_fake_ffp_wvp(IDirect3DDevice9* dev)
 {
     D3DXMATRIX world, view, proj, wvp;
-    dev->GetTransform(D3DTS_WORLD, &world);
-    dev->GetTransform(D3DTS_VIEW, &view);
-    dev->GetTransform(D3DTS_PROJECTION, &proj);
+    if (!shadow::copy_xf(D3DTS_WORLD, (D3DMATRIX*)&world))
+        dev->GetTransform(D3DTS_WORLD, &world);
+    if (!shadow::copy_xf(D3DTS_VIEW, (D3DMATRIX*)&view))
+        dev->GetTransform(D3DTS_VIEW, &view);
+    if (!shadow::copy_xf(D3DTS_PROJECTION, (D3DMATRIX*)&proj))
+        dev->GetTransform(D3DTS_PROJECTION, &proj);
 
     D3DXMatrixMultiply(&wvp, &world, &view);
     D3DXMatrixMultiply(&wvp, &wvp, &proj);
@@ -279,13 +284,22 @@ HRESULT WINAPI SetVertexShader(IDirect3DDevice9* dev, DWORD fvf)
     // [2026-09-14 二批] 引擎每绘制的 SetVertexShader(FVF) 调用点包装 —— 兼任 flush:
     // 本包装不落 vtable 92(内部转 SetVertexDeclaration/SetFVF/整绑), 需在此先刷挂起批。
     gmdx9_fire_flush();
+    // [2026-09-14 修复③] 当前 VS/PS 经影子表借读(零设备调用, 无 AddRef, 不得
+    // Release); 影子未就绪(理论不可达: 本包装只在渲染期执行)退回真 Get + 计数归还。
     IDirect3DVertexShader9* vs = nullptr;
-    if (SUCCEEDED(dev->GetVertexShader(&vs)) && vs != nullptr)
+    bool release_vs = false;
+    if (!shadow::borrow_vs((void**)&vs))
+    {
+        if (SUCCEEDED(dev->GetVertexShader(&vs)) && vs != nullptr)
+            release_vs = true;
+        else
+            vs = nullptr;
+    }
+    if (vs != nullptr)
     {
         // 自定义 VS 已绑定: 引擎的 FVF 重置 → 声明切换, VS 保持。
-        // [2026-09-14] GetVertexShader 会给返回对象加引用(RecoveryTest R8 实证;
-        // 旧注释"D3D9 惯例不 AddRef"有误), 本分支所有出口用完必须 Release,
-        // 否则引擎每次绘制的 FVF 重置都泄漏一个引用 → shader_destroy 后设备对象无法释放。
+        // (真 Get 路径注意: GetVertexShader 会给返回对象加引用(RecoveryTest R8
+        // 实证), 所有出口必须 Release, 否则引擎每次绘制的 FVF 重置都泄漏一个引用。)
         HRESULT hr;
         IDirect3DVertexDeclaration9* decl = nullptr;
         if (fvf == (D3DFVF_XYZ | D3DFVF_DIFFUSE))
@@ -305,13 +319,13 @@ HRESULT WINAPI SetVertexShader(IDirect3DDevice9* dev, DWORD fvf)
         }
         else
         {
-            vs->Release();
+            if (release_vs) vs->Release();
             return D3DERR_INVALIDCALL; // 未知 FVF + 自定义 VS: 引擎忽略返回值, 保持上次声明
         }
 
         if (FAILED(hr))
         {
-            vs->Release();
+            if (release_vs) vs->Release();
             return hr;
         }
         // [2026-08-08] 若当前 VS 是本钩子绑的仿固定管线 VS(ps-only 场景), 每绘制刷一次 WVP
@@ -329,28 +343,34 @@ HRESULT WINAPI SetVertexShader(IDirect3DDevice9* dev, DWORD fvf)
             bool have_shape = (vs == gm80_fake_ffp_vs_shape);
             if (want_shape != have_shape)
             {
-                vs->Release();
+                if (release_vs) vs->Release();
                 return gm80_bind_fake_ffp(dev, fvf);   // 整绑匹配签名的透传 VS + 声明 + WVP
             }
             hr = gm80_update_fake_ffp_wvp(dev);
             if (FAILED(hr))
             {
-                vs->Release();
+                if (release_vs) vs->Release();
                 return hr;
             }
         }
-        vs->Release();
+        if (release_vs) vs->Release();
         return dev->SetVertexDeclaration(decl);
     }
     // 仿固定管线 VS 兜底: 无自定义 VS 但自定义 PS 激活(ps-only)时绑定喂 v0/v1;
     // 实测 ps_3_0 仍全透明 → GMGraphic 已回退 ps_2_0, 本分支留作 vs_3_0 透传 VS 实验。
-    // [2026-09-14] GetPixelShader 同样加引用(与 R8 实证同族), 用完 Release。
-    IDirect3DPixelShader9* ps = nullptr;
-    if (SUCCEEDED(dev->GetPixelShader(&ps)) && ps != nullptr)
+    // [2026-09-14 修复③] PS 判定同走影子(真 Get 路径注意 GetPixelShader 加引用)。
+    void* ps = nullptr;
+    if (!shadow::borrow_ps(&ps))
     {
-        ps->Release();
-        return gm80_bind_fake_ffp(dev, fvf);
+        IDirect3DPixelShader9* got = nullptr;
+        if (SUCCEEDED(dev->GetPixelShader(&got)) && got != nullptr)
+        {
+            ps = got;
+            got->Release();
+        }
     }
+    if (ps != nullptr)
+        return gm80_bind_fake_ffp(dev, fvf);
     return dev->SetFVF(fvf);
 }
 
@@ -449,18 +469,36 @@ HRESULT WINAPI SetTexture_wrap(
     // [2026-09-14 二批] 兼任 flush 钩(槽 65): 纹理绑定是批继承态, 引擎逐绘制的
     // SetTexture 原本让位于 DrawUP 钩冲刷, 现提前到此处 —— 净冲刷次数不变。
     gmdx9_fire_flush();
+    IDirect3DBaseTexture9* bound = pTexture;
     if (Stage == 0 && pTexture == nullptr)
     {
-        IDirect3DPixelShader9* ps = nullptr;
-        if (SUCCEEDED(dev->GetPixelShader(&ps)) && ps != nullptr)
+        // [2026-09-14 修复③] PS 判定走影子借读(真 Get 路径须 Release, 见 R8 实证)。
+        void* ps = nullptr;
+        bool has_ps = shadow::borrow_ps(&ps);
+        if (!has_ps)
         {
-            ps->Release();   // Get 加引用(见 R8 实证), 判定完立即还
+            IDirect3DPixelShader9* got = nullptr;
+            if (SUCCEEDED(dev->GetPixelShader(&got)) && got != nullptr)
+            {
+                ps = got;
+                got->Release();
+            }
+        }
+        if (ps != nullptr)
+        {
             ensure_white_pixel(dev);
             if (white_pixel)
-                return real_set_texture(dev, 0, white_pixel);
+            {
+                bound = white_pixel;   // 影子必须记实际落设备的对象(白像素替换)
+                HRESULT hr = real_set_texture(dev, 0, white_pixel);
+                shadow::update_tex(dev, Stage, bound, hr);
+                return hr;
+            }
         }
     }
-    return real_set_texture(dev, Stage, pTexture);
+    HRESULT hr = real_set_texture(dev, Stage, bound);
+    shadow::update_tex(dev, Stage, bound, hr);
+    return hr;
 }
 
 // DLL 卸载时恢复 vt[65](dllmain DLL_PROCESS_DETACH 调用)。
@@ -620,16 +658,32 @@ static HRESULT(WINAPI* real_set_viewport_vt)(IDirect3DDevice9*, const D3DVIEWPOR
 static HRESULT(WINAPI* real_set_scissor_rect)(IDirect3DDevice9*, const RECT*) = nullptr;
 
 HRESULT WINAPI SetTransform_hook(IDirect3DDevice9* dev, DWORD state, const D3DMATRIX* matrix)
-{ gmdx9_fire_flush(); return real_set_transform(dev, state, matrix); }
+{
+    gmdx9_fire_flush();
+    HRESULT hr = real_set_transform(dev, state, matrix);
+    shadow::update_xf(dev, state, matrix, hr);   // [修复③] 变换族记账
+    return hr;
+}
 HRESULT WINAPI MultiplyTransform_hook(IDirect3DDevice9* dev, DWORD state, const D3DMATRIX* matrix)
-{ gmdx9_fire_flush(); return real_multiply_transform(dev, state, matrix); }
+{
+    gmdx9_fire_flush();
+    HRESULT hr = real_multiply_transform(dev, state, matrix);
+    shadow::update_xf_mul(dev, state, matrix, hr);   // [修复③] 影子原地右乘(语义见 .cpp)
+    return hr;
+}
 // 名带 _vt: 引擎调用点包装 SetViewport_inj(D3D8 旧签名)已存在, 最终落本钩。
 HRESULT WINAPI SetViewport_vt(IDirect3DDevice9* dev, const D3DVIEWPORT9* viewport)
-{ gmdx9_fire_flush(); return real_set_viewport_vt(dev, viewport); }
+{
+    gmdx9_fire_flush();
+    HRESULT hr = real_set_viewport_vt(dev, viewport);
+    shadow::update_vp(dev, viewport, hr);   // [修复③]
+    return hr;
+}
 HRESULT WINAPI SetScissorRect_hook(IDirect3DDevice9* dev, const RECT* rect)
 { gmdx9_fire_flush(); return real_set_scissor_rect(dev, rect); }
 
 // 状态族: 渲染状态/采样/纹理阶段 + 着色器与常量 + 顶点格式与流 + 灯光材质。
+// [2026-09-14 修复③] 影子表覆盖族的记账; 常量/流/灯光族不记账(见 state_shadow.h)。
 static HRESULT(WINAPI* real_set_render_state)(IDirect3DDevice9*, DWORD, DWORD) = nullptr;
 static HRESULT(WINAPI* real_set_texture_stage_state)(IDirect3DDevice9*, DWORD, DWORD, DWORD) = nullptr;
 static HRESULT(WINAPI* real_set_sampler_state)(IDirect3DDevice9*, DWORD, DWORD, DWORD) = nullptr;
@@ -653,20 +707,55 @@ static HRESULT(WINAPI* real_set_clip_plane)(IDirect3DDevice9*, DWORD, const floa
 static HRESULT(WINAPI* real_set_sw_vertex_processing)(IDirect3DDevice9*, BOOL) = nullptr;
 
 HRESULT WINAPI SetRenderState_hook(IDirect3DDevice9* dev, DWORD state, DWORD value)
-{ gmdx9_fire_flush(); return real_set_render_state(dev, state, value); }
+{
+    gmdx9_fire_flush();
+    HRESULT hr = real_set_render_state(dev, state, value);
+    shadow::update_rs(dev, state, value, hr);   // [修复③]
+    return hr;
+}
 HRESULT WINAPI SetTextureStageState_hook(IDirect3DDevice9* dev, DWORD stage, DWORD type, DWORD value)
-{ gmdx9_fire_flush(); return real_set_texture_stage_state(dev, stage, type, value); }
+{
+    gmdx9_fire_flush();
+    HRESULT hr = real_set_texture_stage_state(dev, stage, type, value);
+    shadow::update_tss(dev, stage, type, value, hr);   // [修复③]
+    return hr;
+}
 HRESULT WINAPI SetSamplerState_hook(IDirect3DDevice9* dev, DWORD sampler, DWORD type, DWORD value)
-{ gmdx9_fire_flush(); return real_set_sampler_state(dev, sampler, type, value); }
+{
+    gmdx9_fire_flush();
+    HRESULT hr = real_set_sampler_state(dev, sampler, type, value);
+    shadow::update_samp(dev, sampler, type, value, hr);   // [修复③]
+    return hr;
+}
 HRESULT WINAPI SetVertexDeclaration_hook(IDirect3DDevice9* dev, IDirect3DVertexDeclaration9* decl)
-{ gmdx9_fire_flush(); return real_set_vertex_declaration(dev, decl); }
+{
+    gmdx9_fire_flush();
+    HRESULT hr = real_set_vertex_declaration(dev, decl);
+    shadow::update_decl(dev, decl, hr);   // [修复③]
+    return hr;
+}
 HRESULT WINAPI SetFVF_hook(IDirect3DDevice9* dev, DWORD fvf)
-{ gmdx9_fire_flush(); return real_set_fvf(dev, fvf); }
+{
+    gmdx9_fire_flush();
+    HRESULT hr = real_set_fvf(dev, fvf);
+    shadow::update_fvf(dev, fvf, hr);   // [修复③]
+    return hr;
+}
 // 名带 _vt: 引擎调用点包装 SetVertexShader(FVF 旧签名)已存在, 本钩覆盖 vtable 直呼。
 HRESULT WINAPI SetVertexShader_vt(IDirect3DDevice9* dev, IDirect3DVertexShader9* vs)
-{ gmdx9_fire_flush(); return real_set_vertex_shader_vt(dev, vs); }
+{
+    gmdx9_fire_flush();
+    HRESULT hr = real_set_vertex_shader_vt(dev, vs);
+    shadow::update_vs(dev, vs, hr);   // [修复③]
+    return hr;
+}
 HRESULT WINAPI SetPixelShader_hook(IDirect3DDevice9* dev, IDirect3DPixelShader9* ps)
-{ gmdx9_fire_flush(); return real_set_pixel_shader(dev, ps); }
+{
+    gmdx9_fire_flush();
+    HRESULT hr = real_set_pixel_shader(dev, ps);
+    shadow::update_ps(dev, ps, hr);   // [修复③]
+    return hr;
+}
 HRESULT WINAPI SetVertexShaderConstantF_hook(IDirect3DDevice9* dev, UINT start, const float* data, UINT count)
 { gmdx9_fire_flush(); return real_set_vs_constant_f(dev, start, data, count); }
 HRESULT WINAPI SetVertexShaderConstantI_hook(IDirect3DDevice9* dev, UINT start, const int* data, UINT count)
@@ -765,6 +854,7 @@ static VtHook g_vt_hooks[] = {
 
 // 设备 vtable 钩子组安装: CreateDevice 成功块与 recovery 重建路径共用。
 // 真指针只需首次保存 —— 所有设备对象共享同一驱动实现地址(同 SetTexture 钩子先例)。
+// [2026-09-14 修复③] 安装完成后影子表全量播种(Get* 一次), 此后由 Set* 钩维护。
 bool gmdx9_install_render_hooks(IDirect3DDevice9* dev)
 {
     __try
@@ -782,6 +872,7 @@ bool gmdx9_install_render_hooks(IDirect3DDevice9* dev)
                 VirtualProtect(&vt[g_vt_hooks[i].slot], sizeof(void*), oldp, &oldp);
             }
         }
+        shadow::seed_from_device(dev);
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
     {

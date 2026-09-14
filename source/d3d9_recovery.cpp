@@ -1,5 +1,6 @@
 #include "d3d9_recovery.h"
 #include "main.h"
+#include "state_shadow.h"
 #include <string.h>
 
 static D3DPRESENT_PARAMETERS
@@ -92,7 +93,12 @@ HRESULT WINAPI ResetDevice(IDirect3DDevice9* dev, D3DPRESENT_PARAMETERS* pParams
     {
         HRESULT hr = real_reset(dev, &g_pp9);
         if (SUCCEEDED(hr))
+        {
+            // [2026-09-14 修复③] Reset 后设备状态回到出厂默认 —— 影子表全量重播,
+            // 否则账面停留在 Reset 前的旧值, 后续读账全部失真。
+            shadow::seed_from_device(dev);
             gmdx9_fire_reset_post(false);   // 同设备 Reset: 仅 DEFAULT 资源需重建
+        }
         return hr;
     }
     __except (EXCEPTION_EXECUTE_HANDLER)

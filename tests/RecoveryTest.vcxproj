@@ -73,6 +73,7 @@
     <ClCompile Include="recovery_test.cpp" />
     <ClCompile Include="..\source\d3d9_recovery.cpp" />
     <ClCompile Include="..\source\patch_support.cpp" />
+    <ClCompile Include="..\source\state_shadow.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

@@ -34,6 +34,7 @@
       <Filter>头文件\Project</Filter>
     </ClInclude>
     <ClInclude Include="source\d3d9_recovery.h" />
+    <ClInclude Include="source\state_shadow.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="dllmain.cpp">
@@ -49,5 +50,6 @@
       <Filter>源文件\Core</Filter>
     </ClCompile>
     <ClCompile Include="source\d3d9_recovery.cpp" />
+    <ClCompile Include="source\state_shadow.cpp" />
   </ItemGroup>
 </Project>
