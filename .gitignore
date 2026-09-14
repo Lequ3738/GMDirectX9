@@ -42,3 +42,7 @@ desktop.ini
 *.user
 __pycache__
 PORTING_NOTES.md
+
+# tss_probe 构建输出
+/tests/tss_probe/bin/
+/tests/tss_probe/obj/
