@@ -1,9 +1,9 @@
 {
 	"name": "GMDirectX9",
 	"folder": "gmdx9",
-	"version": "1.8",
+	"version": "1.9",
 	"author": "Lequ",
-	"date": "2026/9/14",
+	"date": "2026/9/15",
 	"license": "Free to use, also for commercial games.",
 	"description": "GMDirectX9: DirectX8 to DirectX9 render-backend replacement for GameMaker 8.0.",
 	"helpfile": "",
